@@ -5,13 +5,40 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "script"))
+script_dir = str(ROOT / "script")
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 
-from financial_parser.canonical import markdown_to_canonical_page
-from financial_parser.config import ParserConfig
-from financial_parser.markdown_utils import extract_markdown_tables, sanitize_markdown
-from financial_parser.models import EngineName, LanguageEvidence, PageClass, PageProfile, QCStatus, RouteDecision
-from financial_parser.qc import evaluate_output
+try:
+    from financial_parser.canonical import _heading_metadata, _unit_and_period, markdown_to_canonical_page
+    from financial_parser.config import ParserConfig
+    from financial_parser.engines import (
+        BaseParser,
+        DeepSeekVisionEngine,
+        DoclingParser,
+        ParserFactory,
+        TATRTableParser,
+        VLMPdfParser,
+        create_vlm_engine,
+    )
+    from financial_parser.markdown_utils import extract_markdown_tables, sanitize_markdown
+    from financial_parser.models import EngineName, LanguageEvidence, PageClass, PageProfile, QCStatus, RouteDecision
+    from financial_parser.qc import evaluate_output
+except ImportError:
+    from script.financial_parser.canonical import _heading_metadata, _unit_and_period, markdown_to_canonical_page
+    from script.financial_parser.config import ParserConfig
+    from script.financial_parser.engines import (
+        BaseParser,
+        DeepSeekVisionEngine,
+        DoclingParser,
+        ParserFactory,
+        TATRTableParser,
+        VLMPdfParser,
+        create_vlm_engine,
+    )
+    from script.financial_parser.markdown_utils import extract_markdown_tables, sanitize_markdown
+    from script.financial_parser.models import EngineName, LanguageEvidence, PageClass, PageProfile, QCStatus, RouteDecision
+    from script.financial_parser.qc import evaluate_output
 
 
 def native_profile(raw_text: str) -> PageProfile:
@@ -84,8 +111,6 @@ class FinancialParserUnitTests(unittest.TestCase):
         self.assertEqual(table["source_refs"], [{"pdf_page": 1}])
 
     def test_deepseek_config_and_factory(self) -> None:
-        from financial_parser.engines import DeepSeekVisionEngine, create_vlm_engine
-
         config = ParserConfig(
             vlm_provider="deepseek",
             deepseek_api_key="sk-test-key",
@@ -98,8 +123,6 @@ class FinancialParserUnitTests(unittest.TestCase):
         self.assertTrue(engine.available(config))
 
     def test_sec_10k_section_and_note_headers(self) -> None:
-        from financial_parser.canonical import _heading_metadata
-
         code, title = _heading_metadata("Item 8. Financial Statements and Supplementary Data")
         self.assertEqual(code, "8")
         self.assertEqual(title, "Item 8 Financial Statements and Supplementary Data")
@@ -113,15 +136,35 @@ class FinancialParserUnitTests(unittest.TestCase):
         self.assertEqual(title, "Item 1A Risk Factors")
 
     def test_sec_10k_unit_and_currency_detection(self) -> None:
-        from financial_parser.canonical import _unit_and_period
-
         unit, _ = _unit_and_period("# Statements of Operations\n(In millions)\nForm 10-K")
         self.assertIsNotNone(unit)
         self.assertEqual(unit["scale"], "million")
         self.assertEqual(unit["currency"], "USD")
         self.assertEqual(unit["raw"], "(In millions)")
 
+    def test_parser_factory_architecture(self) -> None:
+        config = ParserConfig(
+            vlm_provider="deepseek",
+            deepseek_api_key="sk-test-key",
+            deepseek_model="deepseek-flash",
+            vlm_concurrency=4,
+        )
+
+        docling = ParserFactory.create_parser(EngineName.DOCLING, config)
+        self.assertIsInstance(docling, DoclingParser)
+        self.assertIsInstance(docling, BaseParser)
+
+        vlm = ParserFactory.create_parser(EngineName.DEEPSEEK_VLM, config)
+        self.assertIsInstance(vlm, VLMPdfParser)
+        self.assertIsInstance(vlm, BaseParser)
+        self.assertTrue(vlm.is_available())
+
+        tatr = ParserFactory.create_parser(EngineName.TATR, config)
+        self.assertIsInstance(tatr, TATRTableParser)
+        self.assertIsInstance(tatr, BaseParser)
+
+        self.assertEqual(config.vlm_concurrency, 4)
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -7,14 +7,14 @@ import json
 import re
 from collections import Counter
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .canonical import markdown_to_canonical_page
 from .config import ParserConfig
-from .engines import DoclingEngine, EngineExecutionError, EngineUnavailableError, create_vlm_engine
-
+from .engines import EngineExecutionError, EngineUnavailableError, ParserFactory
 from .markdown_utils import sanitize_markdown
 from .models import EngineName, PageClass, PageProfile, QCResult, QCStatus, RouteDecision
 from .profiler import profile_page
@@ -64,8 +64,8 @@ class FinancialReportRouter:
 
     def __init__(self, config: ParserConfig) -> None:
         self.config = config
-        self.docling = DoclingEngine(config)
-        self.vlm = create_vlm_engine(config)
+        self.docling = ParserFactory.create_parser(EngineName.DOCLING, config)
+        self.vlm = ParserFactory.create_vlm_parser(config)
         self.vlm_engine_name = (
             EngineName.GEMINI_VLM if config.vlm_provider == "gemini" else EngineName.DEEPSEEK_VLM
         )
@@ -182,14 +182,15 @@ class FinancialReportRouter:
                 "configuration": {
                     "vlm_provider": self.config.vlm_provider,
                     "vlm_model": active_vlm_model,
+                    "vlm_concurrency": self.config.vlm_concurrency,
                     "render_dpi": self.config.render_dpi,
                     "docling_timeout_seconds": self.config.docling_timeout_seconds,
                 },
                 "profiles": [profiles[number].to_dict() for number in sorted(profiles)],
                 "initial_routes": [routes[number].to_dict() for number in sorted(routes)],
                 "runtime": {
-                    "docling_available": self.docling.available(),
-                    "vlm_available": self.vlm.available(self.config),
+                    "docling_available": self.docling.is_available(),
+                    "vlm_available": self.vlm.is_available(),
                 },
             }
             self._write_json(root / "routing_manifest.json", manifest)
@@ -215,7 +216,7 @@ class FinancialReportRouter:
             # Native pages are processed in contiguous runs to preserve Docling context.
             docling_output: Dict[int, str] = {}
             docling_failures: Dict[int, str] = {}
-            if docling_pages and self.docling.available():
+            if docling_pages and self.docling.is_available():
                 for run_first, run_last in _contiguous_runs(docling_pages):
                     try:
                         docling_output.update(self.docling.parse_run(pdf_path, run_first, run_last))
@@ -223,12 +224,11 @@ class FinancialReportRouter:
                         for page_number in range(run_first, run_last + 1):
                             docling_failures[page_number] = str(error)
 
+            # Pass 1: Process Docling outputs and identify VLM candidates
             for page_number in candidates:
                 page = document[page_number - 1]
                 profile = profiles[page_number]
                 route = routes[page_number]
-                markdown = ""
-                qc: Optional[QCResult] = None
 
                 if route.engine == EngineName.DOCLING and page_number in docling_output:
                     markdown = sanitize_markdown(docling_output[page_number])
@@ -240,7 +240,7 @@ class FinancialReportRouter:
                         )
                         processed[page_number] = {"engine": route.engine.value, "qc": qc.status.value}
                         continue
-                    route = RouteDecision(
+                    routes[page_number] = RouteDecision(
                         pdf_page=page_number,
                         engine=self.vlm_engine_name,
                         reason=["docling_qc_failed", *qc.failures],
@@ -248,7 +248,7 @@ class FinancialReportRouter:
                         fallback_from=EngineName.DOCLING,
                     )
                 elif route.engine == EngineName.DOCLING:
-                    route = RouteDecision(
+                    routes[page_number] = RouteDecision(
                         pdf_page=page_number,
                         engine=self.vlm_engine_name,
                         reason=["docling_did_not_return_page_output", docling_failures.get(page_number, "")],
@@ -256,28 +256,50 @@ class FinancialReportRouter:
                         fallback_from=EngineName.DOCLING,
                     )
 
-                if not self.vlm.available(self.config):
+            # Pass 2: Concurrent VLM Processing for remaining pages
+            vlm_pages = [p for p in candidates if p not in processed]
+            if vlm_pages:
+                if not self.vlm.is_available():
                     api_key_name = "DEEPSEEK_API_KEY" if self.config.vlm_provider == "deepseek" else "GEMINI_API_KEY"
-                    review_records.append(self._review_record(
-                        profile, route, qc,
-                        f"VLM route required but {api_key_name} is not configured",
-                    ))
-                    processed[page_number] = {"engine": EngineName.MANUAL_REVIEW.value, "qc": "not_run"}
-                    continue
+                    for page_number in vlm_pages:
+                        review_records.append(self._review_record(
+                            profiles[page_number], routes[page_number], None,
+                            f"VLM route required but {api_key_name} is not configured",
+                        ))
+                        processed[page_number] = {"engine": EngineName.MANUAL_REVIEW.value, "qc": "not_run"}
+                else:
+                    def _process_vlm_worker(p_num: int) -> Tuple[int, Optional[str], Optional[QCResult], RouteDecision, Optional[str]]:
+                        p_page = document[p_num - 1]
+                        p_profile = profiles[p_num]
+                        p_route = routes[p_num]
+                        try:
+                            p_md, p_qc, p_final = self._parse_with_vlm(page=p_page, profile=p_profile, route=p_route)
+                            return p_num, p_md, p_qc, p_final, None
+                        except (EngineUnavailableError, EngineExecutionError) as err:
+                            return p_num, None, None, p_route, str(err)
 
+                    workers = min(len(vlm_pages), self.config.vlm_concurrency)
+                    if workers > 1:
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            vlm_results = list(executor.map(_process_vlm_worker, vlm_pages))
+                    else:
+                        vlm_results = [_process_vlm_worker(p) for p in vlm_pages]
 
-                try:
-                    markdown, vlm_qc, final_route = self._parse_with_vlm(page=page, profile=profile, route=route)
-                    self._write_page(
-                        pages_dir=pages_dir, document_id=document_id, page=page,
-                        profile=profile, route=final_route, markdown=markdown, qc=vlm_qc,
-                    )
-                    processed[page_number] = {"engine": final_route.engine.value, "qc": vlm_qc.status.value}
-                    if vlm_qc.status == QCStatus.FAIL:
-                        review_records.append(self._review_record(profile, final_route, vlm_qc))
-                except (EngineUnavailableError, EngineExecutionError) as error:
-                    review_records.append(self._review_record(profile, route, qc, str(error)))
-                    processed[page_number] = {"engine": EngineName.MANUAL_REVIEW.value, "qc": "not_run"}
+                    for p_num, p_md, p_qc, p_route, p_err in vlm_results:
+                        p_page = document[p_num - 1]
+                        p_profile = profiles[p_num]
+                        if p_err or p_md is None or p_qc is None:
+                            review_records.append(self._review_record(p_profile, p_route, None, p_err or "Empty VLM output"))
+                            processed[p_num] = {"engine": EngineName.MANUAL_REVIEW.value, "qc": "not_run"}
+                        else:
+                            self._write_page(
+                                pages_dir=pages_dir, document_id=document_id, page=p_page,
+                                profile=p_profile, route=p_route, markdown=p_md, qc=p_qc,
+                            )
+                            processed[p_num] = {"engine": p_route.engine.value, "qc": p_qc.status.value}
+                            if p_qc.status == QCStatus.FAIL:
+                                review_records.append(self._review_record(p_profile, p_route, p_qc))
+
 
             if review_records:
                 queue_path = root / "review_queue.jsonl"

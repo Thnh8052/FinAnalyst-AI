@@ -17,6 +17,7 @@ class ParserConfig:
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
     vlm_max_tokens: int = 8192
+    vlm_concurrency: int = 4
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
     render_dpi: int = 230
@@ -39,6 +40,7 @@ class ParserConfig:
         gemini_model: Optional[str] = None,
         deepseek_model: Optional[str] = None,
         render_dpi: Optional[int] = None,
+        vlm_concurrency: Optional[int] = None,
     ) -> "ParserConfig":
         """Load optional values without exposing API keys in logs or manifests."""
         try:
@@ -63,15 +65,19 @@ class ParserConfig:
             or os.getenv("GEMINI_MODEL", "gemini-flash-latest")
         ).strip()
 
+        concurrency = vlm_concurrency or int(os.getenv("VLM_CONCURRENCY", "4"))
+
         return cls(
             vlm_provider=active_provider,
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
             deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/"),
             deepseek_model=ds_model,
             vlm_max_tokens=int(os.getenv("VLM_MAX_TOKENS", "8192")),
+            vlm_concurrency=max(1, concurrency),
             gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
             gemini_model=gem_model,
             render_dpi=render_dpi or int(os.getenv("FINANCIAL_PARSER_DPI", "230")),
             output_root=output_root or Path(os.getenv("FINANCIAL_PARSER_OUT", "output_financial_parser")),
         )
+
 

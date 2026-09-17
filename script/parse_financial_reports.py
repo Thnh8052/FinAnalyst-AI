@@ -19,11 +19,15 @@ from financial_parser.engines import EngineUnavailableError
 
 
 if sys.platform == "win32":
+    import io
+
     for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")
-        except (AttributeError, OSError):
-            pass
+        if isinstance(stream, io.TextIOWrapper):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except OSError:
+                pass
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", choices=["deepseek", "gemini"], default=None, help="VLM provider for vision/scanned/fallback routes (default: deepseek).")
     parser.add_argument("--model", default=None, help="VLM model name (e.g., deepseek-flash or gemini-flash-latest); overrides env.")
     parser.add_argument("--dpi", type=int, default=None, help="Raster DPI for VLM-routed pages; overrides FINANCIAL_PARSER_DPI.")
+    parser.add_argument("--concurrency", type=int, default=None, help="Number of concurrent VLM workers for vision/fallback pages (default: 4).")
     parser.add_argument("--force", action="store_true", help="Reprocess pages even when canonical JSON already exists.")
     parser.add_argument("--dry-run", action="store_true", help="Write profile and routes only; do not call Docling or VLM.")
     parser.add_argument("--no-vlm", action="store_true", help="Disable VLM calls; pages requiring VLM enter review_queue.jsonl.")
@@ -51,10 +56,12 @@ def main() -> int:
         vlm_provider=args.provider,
         vlm_model=args.model,
         render_dpi=args.dpi,
+        vlm_concurrency=args.concurrency,
     )
     if args.no_vlm:
         config = replace(config, deepseek_api_key="", gemini_api_key="")
     router = FinancialReportRouter(config)
+
 
     try:
         summary = router.process(

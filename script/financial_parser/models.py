@@ -19,6 +19,7 @@ class EngineName(str, Enum):
     DOCLING = "docling"
     DEEPSEEK_VLM = "deepseek_vlm"
     GEMINI_VLM = "gemini_vlm"
+    TATR = "tatr"
     MANUAL_REVIEW = "manual_review"
 
 

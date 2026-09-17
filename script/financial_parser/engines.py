@@ -1,14 +1,24 @@
-"""Docling and Gemini adapters.  Imports of optional packages stay local."""
+"""Parser architecture following Factory Pattern for Document AI.
+
+Includes:
+- BaseParser: Abstract base interface for all engines.
+- DoclingParser: Vector-native PDF + CUDA TableFormer GPU acceleration.
+- VLMPdfParser: Vision LLM adapter supporting DeepSeek Vision & Google Gemini.
+- TATRTableParser: Table Transformer offline table structure recognition.
+- ParserFactory: Central factory to instantiate parser engines.
+"""
 
 from __future__ import annotations
 
 import base64
 import time
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .config import ParserConfig
 from .markdown_utils import clean_markdown_table_pipes
+from .models import EngineName
 
 
 class EngineUnavailableError(RuntimeError):
@@ -19,12 +29,36 @@ class EngineExecutionError(RuntimeError):
     """Raised when an engine returned no usable result."""
 
 
-class DoclingEngine:
-    """Batch native-text parser. One conversion is used for each contiguous run."""
+class BaseParser(ABC):
+    """Abstract base class for all financial document parsers."""
 
     def __init__(self, config: ParserConfig) -> None:
         self.config = config
+
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Check if parser dependencies, GPU, or API keys are available."""
+        pass
+
+    @abstractmethod
+    def parse_page(self, page: Any, pdf_page: int) -> str:
+        """Parse a single PDF page into faithful GitHub-flavored Markdown."""
+        pass
+
+    def parse_run(self, pdf_path: Path, first_page: int, last_page: int) -> Dict[int, str]:
+        """Batch-parse a contiguous run of pages (optional for batch engines)."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not support multi-page batch runs.")
+
+
+class DoclingParser(BaseParser):
+    """Batch native-text parser with GPU TableFormer acceleration."""
+
+    def __init__(self, config: ParserConfig) -> None:
+        super().__init__(config)
         self._converter: Any = None
+
+    def is_available(self) -> bool:
+        return self.available()
 
     @staticmethod
     def available() -> bool:
@@ -72,7 +106,6 @@ class DoclingEngine:
         except Exception:
             pass
 
-        # Not every supported Docling version exposes every option.
         if hasattr(options, "document_timeout"):
             options.document_timeout = self.config.docling_timeout_seconds
         self._converter = DocumentConverter(
@@ -118,9 +151,15 @@ class DoclingEngine:
                 parsed[page_number] = value
         return parsed
 
+    def parse_page(self, page: Any, pdf_page: int) -> str:
+        """Parse a single page via Docling."""
+        pdf_path = Path(page.parent.name)
+        results = self.parse_run(pdf_path, pdf_page, pdf_page)
+        return results.get(pdf_page, "")
 
-class DeepSeekVisionEngine:
-    """Single-page vision parser using DeepSeek Vision API (deepseek-flash)."""
+
+class DeepSeekVisionAdapter:
+    """Vision adapter communicating with DeepSeek OpenAI-compatible chat endpoint."""
 
     SYSTEM_PROMPT = """You transcribe one page from a financial report (SEC Form 10-K, IFRS, or VAS).
 Return only faithful GitHub-flavored Markdown. Do not summarize, calculate, infer, translate, or correct values.
@@ -195,8 +234,8 @@ Ignore only non-data decorative stamps/signatures. Include `<!-- PRINTED_PAGE: N
         raise EngineExecutionError(f"DeepSeek failed for PDF page {pdf_page}: {last_error}")
 
 
-class GeminiVisionEngine:
-    """Single-page vision parser for scans, OCR layers and Docling-QC fallbacks."""
+class GeminiVisionAdapter:
+    """Vision adapter communicating with Google Gemini generateContent endpoint."""
 
     SYSTEM_PROMPT = """You transcribe one page from a financial report (VAS, IFRS, or SEC filing).
 Return only faithful GitHub-flavored Markdown. Do not summarize, calculate, infer, translate, or correct values.
@@ -264,9 +303,75 @@ Ignore only non-data decorative stamps/signatures. Include `<!-- PRINTED_PAGE: N
         raise EngineExecutionError(f"Gemini failed for PDF page {pdf_page}: {last_error}")
 
 
-def create_vlm_engine(config: ParserConfig) -> Any:
-    """Factory to instantiate the active VLM engine (DeepSeek or Gemini)."""
-    if config.vlm_provider == "gemini":
-        return GeminiVisionEngine(config)
-    return DeepSeekVisionEngine(config)
+class VLMPdfParser(BaseParser):
+    """Unified Vision LLM parser supporting DeepSeek and Gemini adapters."""
+
+    def __init__(self, config: ParserConfig) -> None:
+        super().__init__(config)
+        self.adapter: Any
+        if config.vlm_provider == "gemini":
+            self.adapter = GeminiVisionAdapter(config)
+        else:
+            self.adapter = DeepSeekVisionAdapter(config)
+
+    def is_available(self) -> bool:
+        return self.available(self.config)
+
+    @classmethod
+    def available(cls, config: ParserConfig) -> bool:
+        if config.vlm_provider == "gemini":
+            return GeminiVisionAdapter.available(config)
+        return DeepSeekVisionAdapter.available(config)
+
+    def parse_page(self, page: Any, pdf_page: int) -> str:
+        return self.adapter.parse_page(page, pdf_page)
+
+
+class TATRTableParser(BaseParser):
+    """Table Transformer (TATR) parser for local/on-premise offline table recognition."""
+
+    def __init__(self, config: ParserConfig) -> None:
+        super().__init__(config)
+        self._model: Any = None
+
+    def is_available(self) -> bool:
+        try:
+            import torch  # noqa: F401
+            import transformers  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    def parse_page(self, page: Any, pdf_page: int) -> str:
+        if not self.is_available():
+            raise EngineUnavailableError("TATR dependencies not installed. Install transformers, torch, and timm.")
+        # Future on-premise TATR implementation placeholder
+        raise NotImplementedError("TATR offline extraction pipeline will be enabled in offline mode.")
+
+
+class ParserFactory:
+    """Central factory creating document parser instances based on engine contract."""
+
+    @staticmethod
+    def create_parser(engine: EngineName | str, config: ParserConfig) -> BaseParser:
+        engine_enum = EngineName(engine) if isinstance(engine, str) else engine
+        if engine_enum == EngineName.DOCLING:
+            return DoclingParser(config)
+        elif engine_enum in (EngineName.DEEPSEEK_VLM, EngineName.GEMINI_VLM):
+            return VLMPdfParser(config)
+        elif engine_enum == EngineName.TATR:
+            return TATRTableParser(config)
+        raise ValueError(f"Unsupported parser engine: {engine}")
+
+    @staticmethod
+    def create_vlm_parser(config: ParserConfig) -> VLMPdfParser:
+        return VLMPdfParser(config)
+
+
+# Backward-compatibility aliases
+DoclingEngine = DoclingParser
+DeepSeekVisionEngine = VLMPdfParser
+GeminiVisionEngine = VLMPdfParser
+create_vlm_engine = ParserFactory.create_vlm_parser
 
