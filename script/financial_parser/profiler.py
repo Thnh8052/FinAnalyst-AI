@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Iterable, List, Tuple
 
 from .config import ParserConfig
@@ -109,32 +109,134 @@ def _character_ratios(text: str) -> Tuple[float, float, float]:
     return replacement, private_use, control
 
 
-def _likely_tabular(words: List[Any]) -> bool:
-    """Detect repeated rows with two or more numeric cells using native bboxes.
+def _likely_tabular(words: List[Any], page_height: float = 792.0) -> bool:
+    """Detect repeated rows with vertical column alignment using native bboxes.
 
-    This is intentionally a weak signal. It is used only to catch a Docling
-    result that turned an evidently tabular native page into loose paragraphs.
+    A true financial data table has numbers aligned vertically in columns
+    (similar x1 / right-aligned coordinates across distinct y rows).
+    Requires either:
+    1. At least 1 primary numeric column with >= 5 distinct rows, OR
+    2. At least 2 numeric columns with >= 3 distinct rows each (sum of rows >= 6).
     """
-    rows: List[Tuple[float, int]] = []
-    for word in sorted(words, key=lambda item: (float(item[1]), float(item[0]))):
+    numeric_words: List[dict] = []
+    for w in words:
         try:
-            y_mid = (float(word[1]) + float(word[3])) / 2
-            text = str(word[4]).strip()
+            x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+            text = str(w[4]).strip()
         except (IndexError, TypeError, ValueError):
             continue
-        is_number = bool(NUMBER_PATTERN.fullmatch(text))
-        if not rows or abs(rows[-1][0] - y_mid) > 4.0:
-            rows.append((y_mid, int(is_number)))
-        elif is_number:
-            rows[-1] = (rows[-1][0], rows[-1][1] + 1)
-    return sum(number_count >= 2 for _, number_count in rows) >= 2
+        # Filter top and bottom margins (header / footer page numbers)
+        if y0 > page_height * 0.94 or y1 < page_height * 0.05:
+            continue
+        if NUMBER_PATTERN.fullmatch(text):
+            numeric_words.append({
+                "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                "x_mid": (x0 + x1) / 2,
+                "y_mid": (y0 + y1) / 2,
+            })
+
+    if len(numeric_words) < 4:
+        return False
+
+    # Cluster numbers by x1 (right-aligned, standard in financial columns) with tolerance 8.0 pt
+    clusters: defaultdict = defaultdict(list)
+    sorted_by_x1 = sorted(numeric_words, key=lambda w: w["x1"])
+    current_cluster: List[dict] = []
+    for w in sorted_by_x1:
+        if not current_cluster:
+            current_cluster.append(w)
+        else:
+            avg_x1 = sum(item["x1"] for item in current_cluster) / len(current_cluster)
+            if abs(w["x1"] - avg_x1) <= 8.0:
+                current_cluster.append(w)
+            else:
+                if len(current_cluster) >= 3:
+                    clusters[round(avg_x1, 1)].extend(current_cluster)
+                current_cluster = [w]
+    if len(current_cluster) >= 3:
+        avg_x1 = sum(item["x1"] for item in current_cluster) / len(current_cluster)
+        clusters[round(avg_x1, 1)].extend(current_cluster)
+
+    # Count distinct rows (items separated by delta y >= 7.0 pt) in each column cluster
+    valid_cols = []
+    for col_x, items in clusters.items():
+        items_by_y = sorted(items, key=lambda w: w["y_mid"])
+        distinct_y_rows = []
+        for it in items_by_y:
+            if not distinct_y_rows or abs(distinct_y_rows[-1]["y_mid"] - it["y_mid"]) >= 7.0:
+                distinct_y_rows.append(it)
+        if len(distinct_y_rows) >= 3:
+            valid_cols.append({"col_x": col_x, "rows": len(distinct_y_rows)})
+
+    has_deep_single_col = any(c["rows"] >= 5 for c in valid_cols)
+    has_multi_col = len(valid_cols) >= 2 and sum(c["rows"] for c in valid_cols) >= 6
+
+    return has_deep_single_col or has_multi_col
+
+
+RUNNING_MARGIN_PATTERN = re.compile(
+    r"\|\s*\d+\s*$|Form\s*10-[KQ]|Annual\s*Report|Báo\s*cáo|Trang\s*\d+|Page\s*\d+|Exhibit\s*\d+(?:\.\d+)?|^\s*[-–—]?\s*\d+\s*[-–—]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_body_text_and_words(page: Any) -> Tuple[str, List[Any]]:
+    """Extract page body text and words excluding top/bottom running headers and footers."""
+    try:
+        height = float(page.rect.height)
+        blocks = page.get_text("blocks") or []
+        body_blocks: List[str] = []
+        num_blocks = len(blocks)
+        for i, block in enumerate(blocks):
+            text = str(block[4]).strip()
+            y0, y1 = float(block[1]), float(block[3])
+            is_margin_header = (
+                (y1 < height * 0.08 and bool(RUNNING_MARGIN_PATTERN.search(text)))
+                or (y1 < height * 0.04 and len(text.splitlines()) == 1)
+            )
+            is_trailing_block = i >= max(0, num_blocks - 2)
+            is_isolated_page_num = bool(re.fullmatch(r"[-–—]?\s*\d{1,4}\s*[-–—]?", text))
+            is_copyright_footer = bool(re.search(r"all rights reserved|©\s*\d{4}|\(c\)\s*\d{4}", text, re.I))
+            is_margin_footer = (
+                (y0 > height * 0.94 and (bool(RUNNING_MARGIN_PATTERN.search(text)) or len(text.splitlines()) == 1))
+                or (is_trailing_block and is_isolated_page_num and y0 > height * 0.40)
+                or (is_trailing_block and is_copyright_footer and y0 > height * 0.40)
+            )
+            if not is_margin_header and not is_margin_footer:
+                body_blocks.append(str(block[4]))
+
+        all_words = page.get_text("words") or []
+        num_words = len(all_words)
+        body_words = []
+        for i, w in enumerate(all_words):
+            w_text = str(w[4]).strip()
+            w_y0, w_y1 = float(w[1]), float(w[3])
+            is_hdr_w = (
+                (w_y1 < height * 0.08 and bool(RUNNING_MARGIN_PATTERN.search(w_text)))
+                or (w_y1 < height * 0.04 and bool(RUNNING_MARGIN_PATTERN.search(w_text)))
+            )
+            is_trailing_w = i >= max(0, num_words - 4)
+            is_page_num_w = bool(re.fullmatch(r"\d{1,4}", w_text)) and w_y0 > height * 0.40
+            is_ftr_w = (
+                (w_y0 > height * 0.94 and (bool(RUNNING_MARGIN_PATTERN.search(w_text)) or bool(re.fullmatch(r"\d+", w_text))))
+                or (is_trailing_w and is_page_num_w)
+            )
+            if not is_hdr_w and not is_ftr_w:
+                body_words.append(w)
+
+        body_text = "".join(body_blocks).strip()
+        if not body_text:
+            body_text = (page.get_text("text") or "").strip()
+            body_words = all_words
+        return body_text, body_words
+    except Exception:
+        raw = (page.get_text("text") or "").strip()
+        return raw, (page.get_text("words") or [])
 
 
 def profile_page(page: Any, pdf_page: int, config: ParserConfig) -> PageProfile:
     """Profile physical page content and assign a conservative page class."""
-    raw_text = page.get_text("text") or ""
-    words = page.get_text("words") or []
-    cleaned = raw_text.strip()
+    cleaned, words = _extract_body_text_and_words(page)
     page_area = max(1.0, page.rect.width * page.rect.height)
     coverages = _image_coverages(page, page_area)
     max_coverage = max(coverages, default=0.0)
@@ -199,6 +301,6 @@ def profile_page(page: Any, pdf_page: int, config: ParserConfig) -> PageProfile:
         control_char_ratio=round(control, 5),
         type3_font_count=type3_count,
         has_suspicious_font=suspicious_font,
-        likely_tabular=_likely_tabular(words),
+        likely_tabular=_likely_tabular(words, page_height=float(page.rect.height) if hasattr(page, "rect") else 792.0),
         reasons=reasons,
     )

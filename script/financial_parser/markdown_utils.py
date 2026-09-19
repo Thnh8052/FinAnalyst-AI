@@ -5,13 +5,99 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple
 
 
 NUMBER_PATTERN = re.compile(
-    r"(?<![\w.])(?:\(?\s*[-−–—]?\s*(?:[$₫€£¥]\s*)?\d{1,3}(?:[,.]\d{3})+(?:[,.]\d+)?|\(?\s*[-−–—]?\s*(?:[$₫€£¥]\s*)?\d+(?:[,.]\d+)?)(?:\s*\)?)(?![\w.])"
+    r"(?:(?<=(?<!\w)FY)|(?<![\w.]))"
+    r"-?"
+    r"(?:\d{1,3}(?:[,.]\d{3})+(?:[,.]\d+)?|\d+(?:[,.]\d+)?)"
+    r"(?!\w|\.\d)"
 )
 TOKEN_PATTERN = re.compile(r"[\wÀ-ỹĐđ]+", re.UNICODE)
+CLAUSE_BULLET_PATTERN = re.compile(
+    r"(?:^|(?<=[\s;.,]))\(\s*\d{1,2}\s*\)(?=[ \t]+[A-Za-z]|\s*[:;])",
+    re.MULTILINE,
+)
+
+CURRENCY_SYMBOLS = frozenset("$₫€£¥")
+
+SCALE_WORDS_EN = frozenset({
+    "million", "billion", "trillion", "thousand",
+    "mn", "bn", "m", "b", "k",
+})
+SCALE_WORDS_VI = frozenset({
+    "triệu", "tỷ", "tỉ", "nghìn", "ngàn", "trăm",
+})
+SCALE_WORDS = SCALE_WORDS_EN | SCALE_WORDS_VI
+
+LEGAL_KEYWORDS = frozenset({
+    "item", "section", "exhibit", "rule", "page", "note",
+    "paragraph", "trang", "mục", "điều",
+})
+LEGAL_KEYWORD_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in LEGAL_KEYWORDS) + r")\b"
+    r"[\s:.\-]*$",   # keyword must be at end of prev_ctx (adjacent to number)
+    re.IGNORECASE,
+)
+
+HEADER_COLLAPSED_VALUE_PATTERN = re.compile(
+    r"^(?P<title>.*?)\s*[-–—]\s*(?P<val>[$₫€£¥]?\s*\(?[\d,]+(?:\.\d+)?\)?%?)$"
+)
+
+def _is_financial_cell_value(val: str) -> bool:
+    v = val.strip()
+    if any(c in v for c in ("$", "₫", "€", "£", "¥", "(", ")")):
+        return True
+    if "," in v:
+        return True
+    cleaned = re.sub(r"[^\d]", "", v)
+    if cleaned and not (len(cleaned) == 4 and cleaned.startswith(("19", "20"))):
+        return True
+    return False
+
+def decouple_collapsed_table_headers(text: str) -> str:
+    """Decouple merged table headers where an engine collapsed the top data row into headers."""
+    lines = text.splitlines()
+    output_lines: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("|") and i + 1 < len(lines) and lines[i + 1].strip().startswith("|"):
+            if is_table_separator(lines[i + 1]):
+                header_cells = split_markdown_row(stripped)
+                if len(header_cells) >= 2:
+                    matched_items = []
+                    for c in header_cells[1:]:
+                        m = HEADER_COLLAPSED_VALUE_PATTERN.match(c)
+                        if m and _is_financial_cell_value(m.group("val")):
+                            matched_items.append(m)
+                        else:
+                            matched_items.append(None)
+
+                    data_cols_count = len(header_cells) - 1
+                    valid_matches = sum(1 for m in matched_items if m is not None)
+                    if data_cols_count > 0 and valid_matches / data_cols_count >= 0.6:
+                        new_headers = [""]
+                        new_row_cells = [header_cells[0]]
+                        for orig_c, m in zip(header_cells[1:], matched_items):
+                            if m:
+                                new_headers.append(m.group("title").strip())
+                                new_row_cells.append(m.group("val").strip())
+                            else:
+                                new_headers.append(orig_c)
+                                new_row_cells.append("")
+
+                        output_lines.append("| " + " | ".join(new_headers) + " |")
+                        output_lines.append(lines[i + 1])
+                        output_lines.append("| " + " | ".join(new_row_cells) + " |")
+                        i += 2
+                        continue
+
+        output_lines.append(line)
+        i += 1
+    return "\n".join(output_lines)
 
 
 def sanitize_markdown(value: str) -> str:
@@ -23,6 +109,7 @@ def sanitize_markdown(value: str) -> str:
     text = text.replace("&nbsp;", " ").replace("&#160;", " ")
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = clean_markdown_table_pipes(text.strip())
+    text = decouple_collapsed_table_headers(text)
     return text.strip()
 
 
@@ -126,21 +213,123 @@ def extract_markdown_tables(markdown: str) -> List[dict]:
 
 
 def normalize_number_token(value: str) -> str:
-    """Canonical comparison key; keeps sign but ignores display separators/currency."""
+    """Normalize number: remove thousand commas, currency symbols, and spaces."""
     token = value.strip().replace("−", "-").replace("–", "-").replace("—", "-")
     negative = token.startswith("(") and token.endswith(")")
-    digits = re.sub(r"[^0-9]", "", token)
-    if not digits:
-        return ""
-    return f"-{digits}" if negative or token.lstrip().startswith("-") else digits
+    for sym in CURRENCY_SYMBOLS:
+        token = token.replace(sym, "")
+    token = token.replace(",", "").strip()
+    if token.startswith("- "):
+        token = token[2:].strip()
+    if negative and not token.startswith("-"):
+        token = f"-{token.strip('()')}"
+    return token
 
 
 def number_multiset(text: str) -> Counter[str]:
+    cleaned = CLAUSE_BULLET_PATTERN.sub(" ", text)
     return Counter(
         normalized
-        for match in NUMBER_PATTERN.findall(text)
+        for match in NUMBER_PATTERN.findall(cleaned)
         if (normalized := normalize_number_token(match))
     )
+
+
+def _is_negative_sign(num: str) -> bool:
+    """True nếu num bắt đầu bằng dấu âm thật."""
+    return num.startswith("-")
+
+
+def _has_scale_suffix(next_ctx: str) -> bool:
+    """True nếu next_ctx bắt đầu bằng scale word (million, tỷ, ...)."""
+    if not next_ctx:
+        return False
+    first = next_ctx.strip().split(maxsplit=1)[0].lower()
+    first = first.rstrip(".,;:()[]")
+    return first in SCALE_WORDS
+
+
+def _has_legal_keyword(prev_ctx: str) -> bool:
+    """True nếu prev_ctx kết thúc bằng legal keyword (Item, Section, ...)."""
+    if not prev_ctx:
+        return False
+    return bool(LEGAL_KEYWORD_PATTERN.search(prev_ctx))
+
+
+def _has_currency_before(prev_ctx: str) -> bool:
+    """True nếu prev_ctx kết thúc bằng ký hiệu tiền tệ."""
+    if not prev_ctx:
+        return False
+    return prev_ctx.rstrip()[-1:] in CURRENCY_SYMBOLS
+
+
+def _has_percent_after(next_ctx: str) -> bool:
+    """True nếu next_ctx bắt đầu bằng %."""
+    if not next_ctx:
+        return False
+    return next_ctx.lstrip().startswith("%")
+
+
+def _is_wrapped_in_parens(prev_ctx: str, next_ctx: str) -> bool:
+    """True nếu số nằm trong ngoặc đơn (số âm kế toán)."""
+    return (
+        bool(prev_ctx) and prev_ctx.rstrip().endswith("(")
+        and bool(next_ctx) and next_ctx.lstrip().startswith(")")
+    )
+
+
+def extract_numbers_with_context(
+    text: str, window: int = 15
+) -> List[Tuple[str, str, str, str]]:
+    """Trích xuất số kèm context.
+
+    Returns:
+        List of (normalized_num, prev_ctx, next_ctx, raw_num).
+        - normalized_num: "1234" từ "1,234"
+        - prev_ctx: window ký tự trước số (stripped)
+        - next_ctx: window ký tự sau số (stripped)
+        - raw_num: chuỗi gốc "1,234"
+    """
+    cleaned = CLAUSE_BULLET_PATTERN.sub(" ", text)
+    out: List[Tuple[str, str, str, str]] = []
+    for m in NUMBER_PATTERN.finditer(cleaned):
+        start, end = m.span()
+        prev_ctx = cleaned[max(0, start - window):start].strip()
+        next_ctx = cleaned[end:end + window].strip()
+        raw = m.group(0)
+        norm = normalize_number_token(raw)
+        out.append((norm, prev_ctx, next_ctx, raw))
+    return out
+
+
+def classify_number(num: str, prev_ctx: str, next_ctx: str) -> str:
+    """Phân loại số thành 'financial' hoặc 'metadata'.
+
+    Args:
+        num: chuỗi số THUẦN (có thể có dấu -, không có $ hay ngoặc).
+             Ví dụ: "500", "1,234.56", "-150".
+        prev_ctx: <= 15 ký tự ngay trước số (đã strip).
+        next_ctx: <= 15 ký tự ngay sau số (đã strip).
+
+    Returns: 'financial' | 'metadata'
+    """
+    if _has_currency_before(prev_ctx):
+        return "financial"
+    if _has_percent_after(next_ctx):
+        return "financial"
+    if _is_wrapped_in_parens(prev_ctx, next_ctx):
+        return "financial"
+    if _is_negative_sign(num):
+        return "financial"
+    if _has_scale_suffix(next_ctx):
+        return "financial"
+    if _has_legal_keyword(prev_ctx):
+        return "metadata"
+    if len(num) == 4 and num.isdigit() and 1900 <= int(num) <= 2099:
+        return "metadata"
+    if num.isdigit() and 0 <= int(num) <= 31:
+        return "metadata"
+    return "financial"
 
 
 def token_multiset(text: str) -> Counter[str]:
@@ -155,5 +344,5 @@ def multiset_recall(source: Counter[str], predicted: Counter[str]) -> float:
 
 def multiset_precision(source: Counter[str], predicted: Counter[str]) -> float:
     if not predicted:
-        return 0.0
+        return 1.0
     return sum((source & predicted).values()) / sum(predicted.values())

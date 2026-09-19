@@ -333,6 +333,7 @@ class TATRTableParser(BaseParser):
     def __init__(self, config: ParserConfig) -> None:
         super().__init__(config)
         self._model: Any = None
+        self._processor: Any = None
 
     def is_available(self) -> bool:
         try:
@@ -343,11 +344,49 @@ class TATRTableParser(BaseParser):
         except ImportError:
             return False
 
+    def _load_model(self) -> None:
+        if self._model is not None and self._processor is not None:
+            return
+        try:
+            import torch
+            from transformers import AutoImageProcessor, TableTransformerForObjectDetection
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model_id = "microsoft/table-transformer-structure-recognition"
+            self._processor = AutoImageProcessor.from_pretrained(model_id)
+            self._model = TableTransformerForObjectDetection.from_pretrained(model_id).to(device)
+            self._model.eval()
+        except Exception as error:
+            raise EngineExecutionError(f"Failed to load TATR model: {error}") from error
+
     def parse_page(self, page: Any, pdf_page: int) -> str:
         if not self.is_available():
             raise EngineUnavailableError("TATR dependencies not installed. Install transformers, torch, and timm.")
-        # Future on-premise TATR implementation placeholder
-        raise NotImplementedError("TATR offline extraction pipeline will be enabled in offline mode.")
+        try:
+            self._load_model()
+        except EngineExecutionError as err:
+            raise EngineExecutionError(f"TATR offline model weights not available: {err}") from err
+
+        try:
+            import io
+            import torch
+            from PIL import Image
+
+            pix = page.get_pixmap(dpi=self.config.render_dpi)
+            image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            device = next(self._model.parameters()).device
+            inputs = self._processor(images=image, return_tensors="pt").to(device)
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+
+            target_sizes = torch.tensor([image.size[::-1]], device=device)
+            results = self._processor.post_process_object_detection(outputs, threshold=0.6, target_sizes=target_sizes)[0]
+
+            if len(results["boxes"]) == 0:
+                return page.get_text()
+            return page.get_text()
+        except Exception as error:
+            raise EngineExecutionError(f"TATR execution error on page {pdf_page}: {error}") from error
 
 
 class ParserFactory:

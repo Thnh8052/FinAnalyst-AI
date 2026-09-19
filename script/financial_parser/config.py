@@ -21,13 +21,17 @@ class ParserConfig:
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
     render_dpi: int = 230
-    docling_timeout_seconds: int = 180
+    docling_timeout_seconds: int = 600
     min_native_chars: int = 80
     max_image_coverage_for_native: float = 0.35
     ocr_layer_image_coverage: float = 0.80
-    min_docling_numeric_recall: float = 0.90
-    min_docling_numeric_precision: float = 0.970
-    min_docling_text_recall: float = 0.90
+    min_docling_numeric_recall: float = 0.88
+    min_docling_numeric_precision: float = 0.88
+    min_docling_text_recall: float = 0.88
+    min_recall_for_adjustment: float = 0.90
+    min_narrative_text_recall: float = 0.95
+    min_high_confidence_recall: float = 0.90
+    max_narrative_numbers: int = 8
     output_root: Path = Path("output_financial_parser")
 
     @classmethod

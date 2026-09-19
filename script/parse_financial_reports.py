@@ -77,6 +77,18 @@ def main() -> int:
         return 1
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    if not args.dry_run:
+        try:
+            try:
+                from generate_parsing_evaluation_report import generate_report
+            except ImportError:
+                from script.generate_parsing_evaluation_report import generate_report
+            out_target = args.out or (config.output_root / args.pdf_path.stem)
+            generate_report(out_target)
+        except Exception as report_err:
+            print(f"[WARN] Could not auto-generate evaluation report: {report_err}", file=sys.stderr)
+
     if args.fail_on_review and summary.get("review_queue_count", 0):
         return 2
     return 0

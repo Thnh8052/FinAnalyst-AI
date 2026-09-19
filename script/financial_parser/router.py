@@ -29,18 +29,22 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _contiguous_runs(page_numbers: Sequence[int]) -> List[Tuple[int, int]]:
+def _contiguous_runs(page_numbers: Sequence[int], max_run_size: int = 10) -> List[Tuple[int, int]]:
+    """Split page numbers into contiguous runs of at most max_run_size to protect GPU VRAM."""
     if not page_numbers:
         return []
     ordered = sorted(page_numbers)
     runs: List[Tuple[int, int]] = []
     first = previous = ordered[0]
+    count = 1
     for current in ordered[1:]:
-        if current == previous + 1:
+        if current == previous + 1 and count < max_run_size:
             previous = current
+            count += 1
         else:
             runs.append((first, previous))
             first = previous = current
+            count = 1
     runs.append((first, previous))
     return runs
 
@@ -65,6 +69,7 @@ class FinancialReportRouter:
     def __init__(self, config: ParserConfig) -> None:
         self.config = config
         self.docling = ParserFactory.create_parser(EngineName.DOCLING, config)
+        self.tatr = ParserFactory.create_parser(EngineName.TATR, config)
         self.vlm = ParserFactory.create_vlm_parser(config)
         self.vlm_engine_name = (
             EngineName.GEMINI_VLM if config.vlm_provider == "gemini" else EngineName.DEEPSEEK_VLM
@@ -190,6 +195,7 @@ class FinancialReportRouter:
                 "initial_routes": [routes[number].to_dict() for number in sorted(routes)],
                 "runtime": {
                     "docling_available": self.docling.is_available(),
+                    "tatr_available": self.tatr.is_available(),
                     "vlm_available": self.vlm.is_available(),
                 },
             }
@@ -217,7 +223,9 @@ class FinancialReportRouter:
             docling_output: Dict[int, str] = {}
             docling_failures: Dict[int, str] = {}
             if docling_pages and self.docling.is_available():
-                for run_first, run_last in _contiguous_runs(docling_pages):
+                runs = _contiguous_runs(docling_pages)
+                for run_idx, (run_first, run_last) in enumerate(runs, 1):
+                    print(f"Docling processing batch {run_idx}/{len(runs)}: pages {run_first}-{run_last}...", flush=True)
                     try:
                         docling_output.update(self.docling.parse_run(pdf_path, run_first, run_last))
                     except (EngineUnavailableError, EngineExecutionError) as error:
@@ -225,6 +233,7 @@ class FinancialReportRouter:
                             docling_failures[page_number] = str(error)
 
             # Pass 1: Process Docling outputs and identify VLM candidates
+            docling_qc: Dict[int, QCResult] = {}
             for page_number in candidates:
                 page = document[page_number - 1]
                 profile = profiles[page_number]
@@ -232,7 +241,25 @@ class FinancialReportRouter:
 
                 if route.engine == EngineName.DOCLING and page_number in docling_output:
                     markdown = sanitize_markdown(docling_output[page_number])
-                    qc = evaluate_output(markdown, profile, EngineName.DOCLING, self.config)
+                    prev_md = (
+                        sanitize_markdown(docling_output[page_number - 1])
+                        if (page_number - 1) in docling_output
+                        else None
+                    )
+                    next_md = (
+                        sanitize_markdown(docling_output[page_number + 1])
+                        if (page_number + 1) in docling_output
+                        else None
+                    )
+                    qc = evaluate_output(
+                        markdown,
+                        profile,
+                        EngineName.DOCLING,
+                        self.config,
+                        prev_page_markdown=prev_md,
+                        next_page_markdown=next_md,
+                    )
+                    docling_qc[page_number] = qc
                     if qc.status != QCStatus.FAIL:
                         self._write_page(
                             pages_dir=pages_dir, document_id=document_id, page=page,
@@ -240,6 +267,33 @@ class FinancialReportRouter:
                         )
                         processed[page_number] = {"engine": route.engine.value, "qc": qc.status.value}
                         continue
+                    # Pass 1.5: If Docling QC failed on a tabular page, try local offline TATR
+                    if profile.likely_tabular and self.tatr.is_available():
+                        try:
+                            tatr_md = sanitize_markdown(self.tatr.parse_page(page, page_number))
+                            tatr_qc = evaluate_output(tatr_md, profile, EngineName.TATR, self.config)
+                            if tatr_qc.status != QCStatus.FAIL:
+                                tatr_route = RouteDecision(
+                                    pdf_page=page_number,
+                                    engine=EngineName.TATR,
+                                    reason=["docling_qc_failed_tatr_fallback_passed"],
+                                    attempt=2,
+                                    fallback_from=EngineName.DOCLING,
+                                )
+                                self._write_page(
+                                    pages_dir=pages_dir,
+                                    document_id=document_id,
+                                    page=page,
+                                    profile=profile,
+                                    route=tatr_route,
+                                    markdown=tatr_md,
+                                    qc=tatr_qc,
+                                )
+                                processed[page_number] = {"engine": EngineName.TATR.value, "qc": tatr_qc.status.value}
+                                continue
+                        except Exception:
+                            pass
+
                     routes[page_number] = RouteDecision(
                         pdf_page=page_number,
                         engine=self.vlm_engine_name,
@@ -263,7 +317,7 @@ class FinancialReportRouter:
                     api_key_name = "DEEPSEEK_API_KEY" if self.config.vlm_provider == "deepseek" else "GEMINI_API_KEY"
                     for page_number in vlm_pages:
                         review_records.append(self._review_record(
-                            profiles[page_number], routes[page_number], None,
+                            profiles[page_number], routes[page_number], docling_qc.get(page_number),
                             f"VLM route required but {api_key_name} is not configured",
                         ))
                         processed[page_number] = {"engine": EngineName.MANUAL_REVIEW.value, "qc": "not_run"}
