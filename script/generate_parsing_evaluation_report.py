@@ -80,43 +80,53 @@ def generate_report(output_dir: Path, ground_truth_html: Optional[Path] = None) 
     avg_num_precision = sum(num_precisions) / len(num_precisions) if num_precisions else 0.0
     avg_text_recall = sum(text_recalls) / len(text_recalls) if text_recalls else 0.0
 
-    # 4. Check core financial statement pages (NVIDIA 10-K: Pages 52 to 56)
+    # 4. Dynamically detect and audit core financial statement pages
+    core_statement_patterns = [
+        ("Consolidated Statements of Operations / Income", r"Consolidated Statements of (Operations|Income)"),
+        ("Consolidated Statements of Comprehensive Income", r"Consolidated Statements of Comprehensive Income"),
+        ("Consolidated Balance Sheets", r"Consolidated Balance Sheets"),
+        ("Consolidated Statements of Stockholders' Equity", r"Consolidated Statements of (Stockholders'|Shareholders') Equity"),
+        ("Consolidated Statements of Cash Flows", r"Consolidated Statements of Cash Flows"),
+    ]
+    
     core_statements_audit = []
-    known_statements = {
-        52: "Consolidated Statements of Income",
-        53: "Consolidated Statements of Comprehensive Income",
-        54: "Consolidated Balance Sheets",
-        55: "Consolidated Statements of Shareholders' Equity",
-        56: "Consolidated Statements of Cash Flows",
-    }
-    for p_num, title in known_statements.items():
-        if p_num in pages_data:
+    found_pages = set()
+    for title, pat in core_statement_patterns:
+        matched = False
+        for p_num in sorted(pages_data.keys()):
+            if p_num in found_pages:
+                continue
             p_json = pages_data[p_num]
             p_dict = p_json.get("page", {})
-            p_route = p_dict.get("route") or p_json.get("provenance", {}).get("route", {})
-            p_qc = p_dict.get("qc") or p_json.get("provenance", {}).get("qc", {})
-            engine = p_route.get("engine", "unknown")
-            qc_status = p_qc.get("status", "unknown")
             blocks = p_dict.get("blocks", [])
-            tables = [b for b in blocks if b.get("block_type") == "table"]
-            rows_count = sum(len(t.get("rows", [])) for t in tables)
+            headings = [b.get("text", "") for b in blocks if b.get("block_type") == "heading"]
+            full_text = " ".join(headings)
+            if re.search(pat, full_text, re.IGNORECASE):
+                matched = True
+                found_pages.add(p_num)
+                p_route = p_dict.get("route") or p_json.get("provenance", {}).get("route", {})
+                p_qc = p_dict.get("qc") or p_json.get("provenance", {}).get("qc", {})
+                engine = p_route.get("engine", "unknown")
+                qc_status = p_qc.get("status", "unknown")
+                tables = [b for b in blocks if b.get("block_type") == "table"]
+                rows_count = sum(len(t.get("rows", [])) for t in tables)
+                core_statements_audit.append({
+                    "page": p_num,
+                    "title": title,
+                    "status": "PROCESSED",
+                    "engine": engine,
+                    "qc": qc_status,
+                    "tables_count": len(tables),
+                    "total_rows": rows_count,
+                })
+                break
+        if not matched:
             core_statements_audit.append({
-                "page": p_num,
+                "page": "N/A",
                 "title": title,
-                "status": "PROCESSED",
-                "engine": engine,
-                "qc": qc_status,
-                "tables_count": len(tables),
-                "total_rows": rows_count,
-            })
-        else:
-            in_review = any(r.get("pdf_page") == p_num for r in review_records)
-            core_statements_audit.append({
-                "page": p_num,
-                "title": title,
-                "status": "IN_REVIEW_QUEUE" if in_review else "NOT_PROCESSED",
-                "engine": "vlm_fallback_needed" if in_review else "missing",
-                "qc": "fail",
+                "status": "NOT_FOUND",
+                "engine": "N/A",
+                "qc": "N/A",
                 "tables_count": 0,
                 "total_rows": 0,
             })
@@ -191,8 +201,9 @@ def generate_report(output_dir: Path, ground_truth_html: Optional[Path] = None) 
     if review_records:
         target_pages = ", ".join(str(r.get("pdf_page")) for r in review_records)
         md.append(f"1. **Chạy VLM bù cho các trang trong review queue ({target_pages}):**\n")
-        md.append("   ```powershell")
-        md.append(f"   python script/parse_financial_reports.py data/nvidia_2025_10k.pdf --start {review_records[0].get('pdf_page')} --end {review_records[0].get('pdf_page')} --out {output_dir} --provider deepseek --force")
+        pdf_name = f"data/{doc_id}.pdf"
+        md.append("   ```bash")
+        md.append(f"   python script/parse_financial_reports.py {pdf_name} --start {review_records[0].get('pdf_page')} --end {review_records[0].get('pdf_page')} --out \"{output_dir.name}\" --provider deepseek --force")
         md.append("   ```\n")
     else:
         md.append("1. **Toàn bộ kho dữ liệu đã sẵn sàng cho pha tiếp theo (Structure-Aware Chunking & Vector Indexing).**\n")

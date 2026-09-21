@@ -31,6 +31,40 @@ SCALE_WORDS_VI = frozenset({
 })
 SCALE_WORDS = SCALE_WORDS_EN | SCALE_WORDS_VI
 
+# Stopwords EN + VI dùng cho cross-page resolution (recall) và
+# overflow exemption (precision).
+STOPWORDS_EN = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "by",
+    "for", "with", "from", "as", "is", "are", "was", "were", "be", "been",
+    "being", "it", "its", "this", "that", "these", "those", "which",
+    "who", "whom", "whose", "has", "have", "had", "do", "does", "did",
+    "will", "would", "shall", "should", "can", "could", "may", "might",
+    "must", "not", "no", "nor", "but", "if", "then", "than", "so",
+})
+STOPWORDS_VI = frozenset({
+    "và", "của", "các", "có", "được", "cho", "trong", "về", "với",
+    "những", "là", "tại", "theo", "đã", "từ", "này", "đó", "một",
+    "hoặc", "như", "để", "khi", "thì", "mà", "ở", "ra", "vào", "lên",
+    "xuống", "bởi", "do", "sẽ", "đang", "cũng", "rất", "quá", "nếu",
+})
+STOPWORDS = STOPWORDS_EN | STOPWORDS_VI
+
+
+def is_resolvable_token(tok: str) -> bool:
+    """Token được phép dùng để cross-page resolve / overflow exempt.
+
+    Yêu cầu:
+    - Không rỗng
+    - Không phải stopword (EN + VI)
+    - Chứa ít nhất 1 chữ cái (loại bỏ '--', '..', '%%', '§§', ...)
+    """
+    if not tok:
+        return False
+    if tok.lower() in STOPWORDS:
+        return False
+    return any(ch.isalpha() for ch in tok)
+
+
 LEGAL_KEYWORDS = frozenset({
     "item", "section", "exhibit", "rule", "page", "note",
     "paragraph", "trang", "mục", "điều",

@@ -1,0 +1,25 @@
+# FinAnalyst-AI: Production Requirements
+
+# --- Core Document Parsing & Layout ---
+PyMuPDF>=1.24.0
+docling>=2.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# --- Data Structures & Typing ---
+pydantic>=2.6.0
+numpy>=1.26.0
+pandas>=2.2.0
+
+# --- Vector Database & RAG Storage ---
+qdrant-client>=1.19.0
+
+# --- Deep Learning & Embeddings ---
+torch>=2.4.0
+transformers>=4.48.0
+sentence-transformers>=3.3.0
+huggingface-hub>=0.28.0
+
+# --- Evaluation & Benchmarking ---
+scikit-learn>=1.4.0
+tqdm>=4.66.0

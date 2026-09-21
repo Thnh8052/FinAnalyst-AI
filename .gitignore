@@ -58,26 +58,30 @@ Desktop.ini
 .agents/
 
 # ==============================================================================
-# Large Data Files (Financial PDFs & Datasets)
+# Data, Outputs & Scratch
 # ==============================================================================
-data/*.pdf
+data/raw_pdf/
+data/vietnamese_bctc/
+data/sec_filings/
 data/**/*.pdf
-!data/.gitkeep
+!data/gold_test_set/
 
-# ==============================================================================
-# Parser Output & Execution Logs
-# ==============================================================================
 output/
 output_*/
 output_test/
 output_financial_parser/
-review_queue.jsonl
-*.log
 
 # ==============================================================================
-# Legacy / Scratch / Archive Folders
+# Legacy / Scratch / Archive Folders / Docs
 # ==============================================================================
+docs/
+archive/
+scratch/
+test_fix_bugs/
 OLD VER/
 script_old/
 V0.1/
 V0.2/
+REVIEW PARSING/
+review_queue.jsonl
+*.log

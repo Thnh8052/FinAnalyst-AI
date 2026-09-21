@@ -88,11 +88,12 @@ class RouteDecision:
 @dataclass
 class QCResult:
     status: QCStatus
-    source_text_recall: Optional[float]
-    numeric_recall: Optional[float]
-    numeric_precision: Optional[float]
-    table_shape_pass: bool
-    table_count: int
+    source_text_recall: Optional[float] = None
+    source_text_precision: Optional[float] = None
+    numeric_recall: Optional[float] = None
+    numeric_precision: Optional[float] = None
+    table_shape_pass: bool = True
+    table_count: int = 0
     warnings: List[str] = field(default_factory=list)
     failures: List[str] = field(default_factory=list)
 

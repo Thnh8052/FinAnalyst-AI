@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from .config import ParserConfig
 from .markdown_utils import (
     NUMBER_PATTERN,
+    classify_number,
+    extract_numbers_with_context,
     extract_markdown_tables,
+    is_resolvable_token,
     multiset_precision,
     multiset_recall,
     number_multiset,
@@ -23,6 +26,52 @@ DATE_PATTERNS = [
 ]
 RANGE_PATTERN = re.compile(r"^\s*[$₫€£¥]?\s*\(?[\d.,]+%?\)?\s*(?:[-–—]|to)\s*[$₫€£¥]?\s*\(?[\d.,]+%?\)?\s*$", re.I)
 SEC_CODE_PATTERN = re.compile(r"^\s*\d{3,}[-–—]\d+\s*$")
+
+# Digit-boundary year patterns: match FY2025, Q1 2025, standalone 2025.
+# Word boundary (\b) fails between Y and 2 in "FY2025" because both are \w.
+YEAR_PATTERN = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+YEAR_RANGE_PATTERN = re.compile(
+    r"(?<!\d)(?:FY)?(?:19|20)\d{2}\s*[-\u2013\u2014]\s*(?:FY)?(?:19|20)\d{2}(?!\d)"
+)
+
+
+class TableShapeResult(NamedTuple):
+    """Return type for _table_shape: separates hard failures from soft warnings."""
+    pass_: bool               # True if no hard findings
+    table_count: int
+    hard_findings: List[str]  # structure defects → FAIL
+    soft_findings: List[str]  # heuristic warnings → WARNING
+
+
+def _adjacent_dedup(years: List[int]) -> List[int]:
+    """Remove adjacent duplicate years.  [2025,2025,2024,2024] → [2025,2024].
+
+    Empty input → empty output (guard IndexError).
+    Non-adjacent duplicates preserved: [2025,2024,2025] → [2025,2024,2025].
+    """
+    if not years:
+        return []
+    return [years[0]] + [
+        y for i, y in enumerate(years[1:], 1) if y != years[i - 1]
+    ]
+
+
+def _extract_header_years(headers: List[str]) -> List[int]:
+    """Extract standalone years from table headers.
+
+    - Digit boundary (not word boundary) → matches FY2025, Q1 2025
+    - Skip range cells ("2024-2025", "FY2024–FY2025") → prevents false zigzag
+    - Only years in [1900, 2099]
+    """
+    years: List[int] = []
+    for h in headers:
+        if YEAR_RANGE_PATTERN.search(h):
+            continue
+        for m in YEAR_PATTERN.finditer(h):
+            y = int(m.group())
+            if 1900 <= y <= 2099:
+                years.append(y)
+    return years
 
 
 def _is_suspicious_merged_numeric_cell(cell: str, cell_index: int, row: List[str]) -> bool:
@@ -67,25 +116,85 @@ def _is_suspicious_merged_numeric_cell(cell: str, cell_index: int, row: List[str
     return has_empty_sibling
 
 
-def _table_shape(markdown: str) -> Tuple[bool, int, List[str]]:
+def _table_shape(markdown: str) -> TableShapeResult:
+    """Check structure and shape of Markdown tables.
+
+    Returns TableShapeResult with hard findings (→ FAIL) and soft findings (→ WARNING).
+
+    Year monotonic check:
+        LIMITATION: Chỉ bắt được zigzag pattern.
+        Không bắt được reversal đơn giản ([2025, 2024] → [2024, 2025])
+        vì cả 2 đều monotonic.  Full fix cần PDF coords (Bug 8 full).
+    """
     tables = extract_markdown_tables(markdown)
-    warnings: List[str] = []
+    hard: List[str] = []
+    soft: List[str] = []
+
     for table_index, table in enumerate(tables, 1):
         width = len(table["headers"])
+
+        # ── HARD: table width ──
         if width < 2:
-            warnings.append(f"table_{table_index}_has_less_than_two_columns")
+            hard.append(f"table_{table_index}_has_less_than_two_columns")
+
+        # ── SOFT: year order (after adjacent dedup, with range cell skip) ──
+        header_years = _extract_header_years(table["headers"])
+        deduped = _adjacent_dedup(header_years)
+        if len(deduped) >= 2:
+            is_inc = all(deduped[i] < deduped[i + 1] for i in range(len(deduped) - 1))
+            is_dec = all(deduped[i] > deduped[i + 1] for i in range(len(deduped) - 1))
+            if not (is_inc or is_dec):
+                soft.append(f"table_{table_index}_header_year_order_non_monotonic")
+
+        # ── Per-row checks ──
+        numeric_cells_per_col = [0] * width
+        text_cells_per_col = [0] * width
+
         for row_index, row in enumerate(table["rows"], 1):
+            # HARD: cell count mismatch
             if len(row) != width:
-                warnings.append(
+                hard.append(
                     f"table_{table_index}_row_{row_index}_has_{len(row)}_cells_expected_{width}"
                 )
 
             for cell_index, cell in enumerate(row):
+                # HARD: merged numeric cell
                 if _is_suspicious_merged_numeric_cell(cell, cell_index, row):
-                    warnings.append(
+                    hard.append(
                         f"table_{table_index}_row_{row_index}_cell_{cell_index + 1}_possible_merged_numeric_cell"
                     )
-    return not warnings, len(tables), warnings
+
+                # Track column types for inconsistency check
+                if cell_index < width:
+                    c_clean = cell.strip()
+                    if c_clean:
+                        has_num = bool(NUMBER_PATTERN.search(c_clean))
+                        words = [w for w in c_clean.split() if any(ch.isalpha() for ch in w)]
+                        if has_num and len(words) <= 2:
+                            numeric_cells_per_col[cell_index] += 1
+                        elif len(words) >= 4:
+                            text_cells_per_col[cell_index] += 1
+
+        # ── SOFT: column data type inconsistency (heuristic) ──
+        total_rows = len(table["rows"])
+        if total_rows >= 4:
+            for col_idx in range(1, width):
+                if numeric_cells_per_col[col_idx] >= max(3, int(0.6 * total_rows)):
+                    if text_cells_per_col[col_idx] >= 2:
+                        soft.append(
+                            f"table_{table_index}_column_{col_idx + 1}_inconsistent_data_types"
+                        )
+
+    # Cross-table year direction check: REMOVED.
+    # Without past/future context, comparing historical (desc) vs maturity (asc)
+    # tables on the same page produces false positives.
+
+    return TableShapeResult(
+        pass_=not hard,
+        table_count=len(tables),
+        hard_findings=hard,
+        soft_findings=soft,
+    )
 
 
 VERB_PATTERN = re.compile(
@@ -186,6 +295,7 @@ def evaluate_output(
         return QCResult(
             status=QCStatus.FAIL,
             source_text_recall=0.0 if profile.raw_text else None,
+            source_text_precision=0.0 if profile.raw_text else None,
             numeric_recall=0.0 if profile.raw_text else None,
             numeric_precision=0.0 if profile.raw_text else None,
             table_shape_pass=False,
@@ -193,60 +303,165 @@ def evaluate_output(
             failures=["empty_parser_output"],
         )
 
-    shape_pass, table_count, structure_findings = _table_shape(value)
-    source_is_reliable = profile.page_class.value == "native_text" and bool(profile.raw_text)
+    shape_result = _table_shape(value)
+    shape_pass = shape_result.pass_
+    table_count = shape_result.table_count
+    source_is_reliable = (
+        profile.page_class.value == "native_text"
+        and bool(profile.raw_text and profile.raw_text.strip())
+    )
     source_text_recall: Optional[float] = None
+    source_text_precision: Optional[float] = None
     numeric_recall: Optional[float] = None
     numeric_precision: Optional[float] = None
     failures: List[str] = []
-    warnings: List[str] = list(structure_findings)
-    source_numbers: Counter = number_multiset(profile.raw_text) if profile.raw_text else Counter()
+    warnings: List[str] = list(shape_result.soft_findings)
+    source_numbers: Counter = Counter()  # computed inside source_is_reliable block
+    missing_tokens: Counter = Counter()  # computed once, reused
 
     if source_is_reliable:
         source_tokens = token_multiset(profile.raw_text)
+        if not source_tokens:
+            warnings.append("source_text_empty_after_tokenization")
+            source_is_reliable = False
+
+    if source_is_reliable:
+        source_numbers = number_multiset(profile.raw_text)
         predicted_tokens = token_multiset(value)
+        missing_tokens = source_tokens - predicted_tokens  # compute once, reuse below
         source_text_recall = multiset_recall(source_tokens, predicted_tokens)
+        source_text_precision = (
+            multiset_precision(source_tokens, predicted_tokens)
+            if predicted_tokens else None
+        )
         predicted_numbers = number_multiset(value)
-        numeric_recall = multiset_recall(source_numbers, predicted_numbers)
-        numeric_precision = multiset_precision(source_numbers, predicted_numbers)
+        numeric_recall = (
+            multiset_recall(source_numbers, predicted_numbers)
+            if source_numbers else None
+        )
+        numeric_precision = (
+            multiset_precision(source_numbers, predicted_numbers)
+            if predicted_numbers else None
+        )
+
+        source_num_contexts = extract_numbers_with_context(profile.raw_text)
+        source_financial = {
+            n_val for n_val, p_ctx, n_ctx, _ in source_num_contexts
+            if classify_number(n_val, p_ctx, n_ctx) == "financial"
+        }
+        pred_num_contexts = extract_numbers_with_context(value)
+        predicted_financial = {
+            n_val for n_val, p_ctx, n_ctx, _ in pred_num_contexts
+            if classify_number(n_val, p_ctx, n_ctx) == "financial"
+        }
 
         # Cross-page boundary recall resolution (text and numbers):
-        # A single paragraph spanning page breaks may be attached to the previous page
-        # or next page by a document-level parser (like Docling).
-        if source_tokens and source_text_recall < config.min_docling_text_recall:
-            missing_tokens = source_tokens - predicted_tokens
-            resolved_tokens = Counter()
+        # Bug 3 fix: Only resolve genuine alphabetic tokens (not stopwords).
+        # Reject-all: If candidate tokens exceed cap, reject resolution completely to prevent masking loss.
+        # Cross-page recall resolution: reject-all semantics when candidate > cap.
+        # Rationale: recall ưu tiên an toàn — nếu truncate, loss > cap → false PASS.
+        if source_tokens and source_text_recall is not None and source_text_recall < config.min_docling_text_recall:
+            resolvable_missing = Counter({
+                tok: cnt for tok, cnt in missing_tokens.items()
+                if is_resolvable_token(tok)
+            })
+            adjacent_tokens = Counter()
             if prev_page_markdown:
-                resolved_tokens |= (missing_tokens & token_multiset(prev_page_markdown))
+                adjacent_tokens |= token_multiset(prev_page_markdown)
             if next_page_markdown:
-                resolved_tokens |= (missing_tokens & token_multiset(next_page_markdown))
-            if resolved_tokens:
-                adj_tokens = predicted_tokens + resolved_tokens
+                adjacent_tokens |= token_multiset(next_page_markdown)
+
+            candidate_resolved = resolvable_missing & adjacent_tokens
+            total_candidate = sum(candidate_resolved.values())
+            cap = max(int(config.max_cross_page_token_ratio * sum(source_tokens.values())), 3)
+
+            # Reject-all when candidate exceeds cap
+            if 0 < total_candidate <= cap:
+                adj_tokens = predicted_tokens + candidate_resolved
                 adj_text_rec = multiset_recall(source_tokens, adj_tokens)
                 if adj_text_rec >= config.min_docling_text_recall:
                     warnings.append(f"cross_page_boundary_resolved_text_recall:{adj_text_rec:.3f}")
                     source_text_recall = adj_text_rec
 
-        if source_numbers and numeric_recall < config.min_docling_numeric_recall:
+        if source_numbers and numeric_recall is not None and numeric_recall < config.min_docling_numeric_recall:
             missing = source_numbers - predicted_numbers
-            resolved = Counter()
+            # Filter: Only allow resolving financial numbers (discard metadata/year/ordinals)
+            resolvable_missing_nums = Counter({
+                n_val: missing[n_val] for n_val in missing if n_val in source_financial
+            })
+
+            adjacent_numbers = Counter()
             if prev_page_markdown:
-                resolved |= (missing & number_multiset(prev_page_markdown))
+                adjacent_numbers |= number_multiset(prev_page_markdown)
             if next_page_markdown:
-                resolved |= (missing & number_multiset(next_page_markdown))
-            if resolved:
-                adj_predicted_numbers = predicted_numbers + resolved
+                adjacent_numbers |= number_multiset(next_page_markdown)
+
+            candidate_num_resolved = resolvable_missing_nums & adjacent_numbers
+            total_num_candidate = sum(candidate_num_resolved.values())
+            num_cap = max(int(config.max_cross_page_token_ratio * sum(source_numbers.values())), 3)
+
+            # Reject-all when candidate numbers exceed cap
+            if 0 < total_num_candidate <= num_cap:
+                adj_predicted_numbers = predicted_numbers + candidate_num_resolved
                 adj_recall = multiset_recall(source_numbers, adj_predicted_numbers)
                 if adj_recall >= config.min_docling_numeric_recall:
                     warnings.append(f"cross_page_boundary_resolved_numeric_recall:{adj_recall:.3f}")
                     numeric_recall = adj_recall
+
+        # ---------- Text Precision Gate (Bug 6) ----------
+        # Parser hallucinate text -> recall cao nhưng precision thấp.
+        # Mirror logic của numeric precision: cho phép exemption cho token
+        # xuất hiện ở trang kề (benefit of the doubt), nhưng cap 5%.
+        if (
+            predicted_tokens
+            and source_text_precision is not None
+            and source_text_precision < config.min_docling_text_precision
+        ):
+            extra_tokens = predicted_tokens - source_tokens
+            resolvable_extra = Counter({
+                tok: cnt for tok, cnt in extra_tokens.items()
+                if is_resolvable_token(tok)
+            })
+
+            adjacent_tokens = Counter()
+            if prev_page_markdown:
+                adjacent_tokens |= token_multiset(prev_page_markdown)
+            if next_page_markdown:
+                adjacent_tokens |= token_multiset(next_page_markdown)
+
+            overflow_candidates = sum((resolvable_extra & adjacent_tokens).values())
+            cap = max(int(config.max_cross_page_token_ratio * sum(predicted_tokens.values())), 3)
+            exempt = min(overflow_candidates, cap)
+
+            common = source_tokens & predicted_tokens
+            adj_predicted_total = max(1, sum(predicted_tokens.values()) - exempt)
+            adj_precision = sum(common.values()) / adj_predicted_total
+
+            if adj_precision >= config.min_docling_text_precision:
+                warnings.append(f"text_precision_adjusted:{adj_precision:.3f}")
+                source_text_precision = adj_precision
+            elif sum(extra_tokens.values()) <= 3:
+                # Fix: check if extra tokens contain actual numbers.
+                # Original had type mismatch: extra_tokens.keys() are text tokens,
+                # predicted_financial are normalized number strings — intersection always empty.
+                extra_has_numbers = any(NUMBER_PATTERN.search(tok) for tok in extra_tokens)
+                if not extra_has_numbers:
+                    warnings.append(f"text_precision_minor_delta:{source_text_precision:.3f}")
+                else:
+                    failures.append(f"text_precision_below_gate:{source_text_precision:.3f}")
+            else:
+                failures.append(
+                    f"text_precision_below_gate:{source_text_precision:.3f}"
+                )
 
         # Precision adjustment for repeated table year headers & bounded cross-page overflow:
         # Repeating column fiscal year headers (e.g. 2025, 2024) across sub-tables
         # is structurally beneficial and must not fail the precision gate.
         if (
             predicted_numbers
+            and numeric_precision is not None
             and numeric_precision < config.min_docling_numeric_precision
+            and numeric_recall is not None
             and numeric_recall >= config.min_recall_for_adjustment
         ):
             extra = predicted_numbers - source_numbers
@@ -301,34 +516,57 @@ def evaluate_output(
 
         # The gates apply to either engine whenever the native PDF text is a
         # reliable oracle. A VLM fallback must not bypass a known numeric loss.
+        # A page is narrative when text recall is high, numeric density is low,
+        # and table count is small.
+        num_density = sum(source_numbers.values()) / max(1, sum(source_tokens.values()))
         is_narrative_page = (
             source_text_recall is not None
             and source_text_recall >= config.min_narrative_text_recall
+            and num_density < 0.20
             and (
                 table_count == 0
                 or (table_count <= 1 and sum(source_numbers.values()) <= config.max_narrative_numbers)
             )
         )
 
-        if source_text_recall < config.min_docling_text_recall:
-            failures.append(f"source_text_recall_below_gate:{source_text_recall:.3f}")
-        if source_numbers and numeric_recall < config.min_docling_numeric_recall:
-            if is_narrative_page:
-                warnings.append(f"narrative_minor_numeric_delta:recall={numeric_recall:.3f}")
+        if source_text_recall is not None and source_text_recall < config.min_docling_text_recall:
+            if sum(missing_tokens.values()) <= 3 and not (source_financial & set(missing_tokens.keys())):
+                warnings.append(f"source_text_recall_minor_delta:{source_text_recall:.3f}")
             else:
-                failures.append(f"numeric_recall_below_gate:{numeric_recall:.3f}")
-        if predicted_numbers and numeric_precision < config.min_docling_numeric_precision:
+                failures.append(f"source_text_recall_below_gate:{source_text_recall:.3f}")
+
+        # Bug 7: Differentiate financial numbers vs metadata numbers on narrative and non-narrative pages
+        if source_numbers and numeric_recall is not None and numeric_recall < config.min_docling_numeric_recall:
+            missing_critical = source_financial - set(predicted_numbers.keys())
             if is_narrative_page:
-                warnings.append(f"narrative_minor_numeric_delta:precision={numeric_precision:.3f}")
-            else:
-                failures.append(f"numeric_precision_below_gate:{numeric_precision:.3f}")
+                if missing_critical:
+                    failures.append(f"narrative_financial_missing:{numeric_recall:.3f}")
+                else:
+                    warnings.append(f"narrative_minor_numeric_delta:recall={numeric_recall:.3f}")
+            else:  # non-narrative
+                if missing_critical:
+                    failures.append(f"financial_recall_below_gate:{numeric_recall:.3f}")
+                else:
+                    warnings.append(f"numeric_recall_metadata_only:{numeric_recall:.3f}")
+
+        if predicted_numbers and numeric_precision is not None and numeric_precision < config.min_docling_numeric_precision:
+            extra_critical = predicted_financial - set(source_numbers.keys())
+            if is_narrative_page:
+                if extra_critical:
+                    failures.append(f"narrative_financial_hallucinated:{numeric_precision:.3f}")
+                else:
+                    warnings.append(f"narrative_minor_numeric_delta:precision={numeric_precision:.3f}")
+            else:  # non-narrative
+                if extra_critical:
+                    failures.append(f"financial_precision_below_gate:{numeric_precision:.3f}")
+                else:
+                    warnings.append(f"numeric_precision_metadata_only:{numeric_precision:.3f}")
     else:
         warnings.append("no_reliable_native_text_oracle_for_fidelity_check")
 
     if not shape_pass:
-        # A malformed Markdown table is unsafe for Structure Chunking regardless
-        # of which parser generated it.
-        failures.extend(item for item in structure_findings if item not in failures)
+        # Only hard structure findings cause FAIL — soft findings are already in warnings.
+        failures.extend(item for item in shape_result.hard_findings if item not in failures)
     if profile.likely_tabular and table_count == 0:
         # Native geometry suggests tabular layout. Missing table in output
         # = lost structure = FAIL, unless fail-safe structural signals confirm genuine narrative text.
@@ -353,6 +591,7 @@ def evaluate_output(
     return QCResult(
         status=status,
         source_text_recall=round(source_text_recall, 4) if source_text_recall is not None else None,
+        source_text_precision=round(source_text_precision, 4) if source_text_precision is not None else None,
         numeric_recall=round(numeric_recall, 4) if numeric_recall is not None else None,
         numeric_precision=round(numeric_precision, 4) if numeric_precision is not None else None,
         table_shape_pass=shape_pass,

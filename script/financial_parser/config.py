@@ -28,11 +28,42 @@ class ParserConfig:
     min_docling_numeric_recall: float = 0.88
     min_docling_numeric_precision: float = 0.88
     min_docling_text_recall: float = 0.88
+    min_docling_text_precision: float = 0.88
+    min_text_recall: float = 0.88
+    min_text_precision: float = 0.88
+    min_numeric_recall: float = 0.88
+    min_numeric_precision: float = 0.88
     min_recall_for_adjustment: float = 0.90
     min_narrative_text_recall: float = 0.95
     min_high_confidence_recall: float = 0.90
     max_narrative_numbers: int = 8
+    max_cross_page_token_ratio: float = 0.05
     output_root: Path = Path("output_financial_parser")
+
+    def __post_init__(self):
+        # Sync values when aliases are explicitly overridden
+        if self.min_text_precision != 0.88 and self.min_docling_text_precision == 0.88:
+            object.__setattr__(self, "min_docling_text_precision", self.min_text_precision)
+        elif self.min_docling_text_precision != 0.88 and self.min_text_precision == 0.88:
+            object.__setattr__(self, "min_text_precision", self.min_docling_text_precision)
+
+        if self.min_text_recall != 0.88 and self.min_docling_text_recall == 0.88:
+            object.__setattr__(self, "min_docling_text_recall", self.min_text_recall)
+        elif self.min_docling_text_recall != 0.88 and self.min_text_recall == 0.88:
+            object.__setattr__(self, "min_text_recall", self.min_docling_text_recall)
+
+        if self.min_numeric_recall != 0.88 and self.min_docling_numeric_recall == 0.88:
+            object.__setattr__(self, "min_docling_numeric_recall", self.min_numeric_recall)
+        elif self.min_docling_numeric_recall != 0.88 and self.min_numeric_recall == 0.88:
+            object.__setattr__(self, "min_numeric_recall", self.min_docling_numeric_recall)
+
+        if self.min_numeric_precision != 0.88 and self.min_docling_numeric_precision == 0.88:
+            object.__setattr__(self, "min_docling_numeric_precision", self.min_numeric_precision)
+        elif self.min_docling_numeric_precision != 0.88 and self.min_numeric_precision == 0.88:
+            object.__setattr__(self, "min_numeric_precision", self.min_docling_numeric_precision)
+
+        if self.min_narrative_text_recall < self.min_text_recall:
+            object.__setattr__(self, "min_narrative_text_recall", self.min_text_recall)
 
     @classmethod
     def from_environment(
