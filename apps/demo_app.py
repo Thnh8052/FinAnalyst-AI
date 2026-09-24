@@ -24,7 +24,7 @@ from financial_rag.config import (
     OUTPUT_RETRIEVAL_ROOT,
     get_collection_name,
 )
-from financial_rag.retrieval import DenseRetriever
+from financial_rag.retrieval import HybridRetriever, DenseRetriever
 from financial_rag.testbed import load_gold_test_set, is_chunk_relevant
 
 # ==============================================================================
@@ -288,9 +288,8 @@ def load_chunks_for_method(doc_id: str, method_folder: str):
 
 @st.cache_resource
 def get_dense_retriever():
-    """Instantiate and cache DenseRetriever singleton for high-speed multi-query inference."""
-    dr = DenseRetriever()
-    return dr
+    """Instantiate and cache HybridRetriever singleton for high-speed multi-query inference."""
+    return HybridRetriever()
 
 
 @st.cache_data
@@ -807,15 +806,22 @@ else:
             )
 
         # Settings row
-        s_c1, s_c2, s_c3 = st.columns([1, 1, 1])
+        s_c1, s_c2, s_c3, s_c4 = st.columns([1.3, 0.9, 1.0, 1.2])
         with s_c1:
-            top_k_select = st.slider("Số lượng Top Chunks hiển thị (Top-K):", min_value=1, max_value=10, value=5)
+            search_mode = st.radio(
+                "Chế độ Tìm kiếm (Search Engine):",
+                ["hybrid", "dense"],
+                format_func=lambda x: "🔥 V1 Hybrid (Dense + BM25 RRF)" if x == "hybrid" else "⚡ V0 Pure Dense (BGE Baseline)",
+                index=0,
+            )
         with s_c2:
-            use_filter = st.checkbox("Áp dụng Metadata Post-Filter theo Ticker", value=False)
+            top_k_select = st.slider("Số lượng Top Chunks (Top-K):", min_value=1, max_value=10, value=5)
+        with s_c3:
+            use_filter = st.checkbox("Áp dụng Filter Ticker", value=False)
             filter_ticker = None
             if use_filter:
                 filter_ticker = st.selectbox("Chọn Ticker lọc:", ["AAPL", "AMZN", "AMD", "INTC", "NKE", "NVDA", "WMT"])
-        with s_c3:
+        with s_c4:
             st.markdown("<br>", unsafe_allow_html=True)
             run_search_btn = st.button("🚀 THỰC THI TRUY XUẤT ĐỐI SÁNH 5 PHƯƠNG PHÁP", type="primary", use_container_width=True)
 
@@ -825,7 +831,7 @@ else:
         if run_search_btn or user_query:
             retriever = get_dense_retriever()
 
-            st.markdown(f"### 🎯 Kết Quả Đối Sánh Song Song 5 Phương Pháp (Top {top_k_select} Chunks)")
+            st.markdown(f"### 🎯 Kết Quả Đối Sánh Song Song 5 Phương Pháp (Top {top_k_select} Chunks | Chế độ: **{search_mode.upper()}**)")
             st.markdown(f"**Truy vấn:** *\"{user_query}\"*")
 
             # 5 Columns for 5 Methods
@@ -849,6 +855,7 @@ else:
                             collection_name=coll_name,
                             query=user_query,
                             top_k=top_k_select,
+                            mode=search_mode,
                             ticker=filter_ticker if use_filter else None
                         )
                         elapsed_ms = (time.perf_counter() - start_t) * 1000.0

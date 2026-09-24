@@ -1,16 +1,17 @@
-"""Master End-to-End Runner for FinAnalyst-AI Financial RAG Pipeline.
+"""Master End-to-End Runner for FinAnalyst-AI Financial RAG Pipeline (V1 Native Hybrid & V0 Dense).
 
-Supports multi-model embedding benchmark via --model argument.
+Supports multi-model embedding benchmark via --model argument and hybrid/dense search modes via --mode.
 
 Usage:
-    # Run entire pipeline from embedding to evaluation:
-    python src/financial_rag/run_pipeline.py --stage all --model qwen3
+    # Run entire pipeline with V1 Hybrid retrieval (BGE-base + Qdrant BM25 RRF):
+    python src/financial_rag/run_pipeline.py --stage all --model bge_base --mode hybrid
 
-    # Run specific stages with specific model:
-    python src/financial_rag/run_pipeline.py --stage embed --model qwen3
-    python src/financial_rag/run_pipeline.py --stage embed --model bge_m3
-    python src/financial_rag/run_pipeline.py --stage index --model qwen3 --recreate
-    python src/financial_rag/run_pipeline.py --stage evaluate --model qwen3
+    # Run sparse lexical indexing for existing Qdrant collections:
+    python src/financial_rag/run_pipeline.py --stage index_sparse --model bge_base
+
+    # Run retrieval evaluation:
+    python src/financial_rag/run_pipeline.py --stage evaluate --model bge_base --mode hybrid
+    python src/financial_rag/run_pipeline.py --stage evaluate --model bge_base --mode dense
 """
 
 import argparse
@@ -31,6 +32,7 @@ from financial_rag.config import (
     CHUNK_METHODS,
     COMPANIES,
     OUTPUT_CHUNKING_ROOT,
+    OUTPUT_RETRIEVAL,
     OUTPUT_RETRIEVAL_ROOT,
     GOLD_TEST_SET_FILE,
     EMBEDDING_PROVIDERS,
@@ -46,7 +48,7 @@ from financial_rag.embeddings import (
     load_cached_embeddings,
 )
 from financial_rag.indexing import QdrantIndexer
-from financial_rag.retrieval import DenseRetriever
+from financial_rag.retrieval import HybridRetriever, DenseRetriever
 from financial_rag.testbed import load_gold_test_set
 from financial_rag.evaluation import RetrievalEvaluator
 
@@ -59,14 +61,13 @@ logger = logging.getLogger("RAGPipeline")
 
 
 def load_chunks_for_method(method_key: str) -> List[Dict[str, Any]]:
-    """Load all chunks for a given method across all 4 companies."""
+    """Load all chunks for a given method across all 35 companies/filings."""
     folder_name = CHUNK_METHODS[method_key]["folder_name"]
     all_chunks: List[Dict[str, Any]] = []
 
     for comp in COMPANIES:
         chunk_file = OUTPUT_CHUNKING_ROOT / comp / folder_name / "chunks.jsonl"
         if not chunk_file.exists():
-            logger.warning(f"File not found: {chunk_file}")
             continue
 
         with open(chunk_file, "r", encoding="utf-8") as f:
@@ -75,16 +76,12 @@ def load_chunks_for_method(method_key: str) -> List[Dict[str, Any]]:
                 if line:
                     all_chunks.append(json.loads(line))
 
-    logger.info(f"Loaded {len(all_chunks)} chunks for {method_key} across {len(COMPANIES)} companies.")
+    logger.info(f"Loaded {len(all_chunks)} chunks for {method_key} across company filings.")
     return all_chunks
 
 
 def run_embedding_stage(methods: List[str], model_key: str) -> None:
-    """Stage 1: Generate and cache vector embeddings for all methods.
-
-    Embeddings are saved to a model-scoped subdirectory:
-        embeddings_cache/{model_key}/{method_key}_embeddings.npz
-    """
+    """Stage 1: Generate and cache dense vector embeddings for all methods."""
     provider = get_provider_config(model_key)
     cache_dir = get_embeddings_cache_dir(model_key)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -118,11 +115,7 @@ def run_embedding_stage(methods: List[str], model_key: str) -> None:
 
 
 def run_indexing_stage(methods: List[str], model_key: str, recreate: bool = False) -> None:
-    """Stage 2: Index chunks and embeddings into Qdrant collections.
-
-    Collection names are scoped by model:
-        finanalyst_v0_{model_key}_{method_key}
-    """
+    """Stage 2: Index chunks and dense embeddings into Qdrant collections."""
     provider = get_provider_config(model_key)
     cache_dir = get_embeddings_cache_dir(model_key)
 
@@ -137,7 +130,6 @@ def run_indexing_stage(methods: List[str], model_key: str, recreate: bool = Fals
         if not chunks:
             continue
 
-        # Load vectors from cache
         cached = load_cached_embeddings(cache_file)
         if not cached:
             logger.error(f"Embeddings not found in cache for {method_key}. Run --stage embed first.")
@@ -149,6 +141,50 @@ def run_indexing_stage(methods: List[str], model_key: str, recreate: bool = Fals
 
         stats = indexer.get_collection_info(coll_name)
         logger.info(f"Collection '{coll_name}' stats: {stats}")
+
+
+def run_sparse_indexing_stage(methods: List[str], model_key: str, batch_size: int = 256) -> None:
+    """Stage 2.5: Populate named 'sparse' vectors using FastEmbed Qdrant/bm25."""
+    logger.info("=== STAGE 2.5: SPARSE LEXICAL INDEXING (Qdrant/bm25) ===")
+    try:
+        from fastembed import SparseTextEmbedding
+    except ImportError:
+        logger.error("fastembed is not installed. Please run: pip install fastembed")
+        return
+
+    sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+    indexer = QdrantIndexer()
+
+    for method_key in methods:
+        method_info = CHUNK_METHODS[method_key]
+        coll_name = get_collection_name(model_key, method_key)
+        disp_name = method_info["display_name"]
+        text_key = method_info["retrieval_text_key"]
+
+        logger.info(f"Generating FastEmbed BM25 vectors for {disp_name} ({coll_name})...")
+        chunks = load_chunks_for_method(method_key)
+        if not chunks:
+            continue
+
+        chunk_ids = [c["chunk_id"] for c in chunks]
+        texts = [extract_retrieval_text(c, text_key=text_key) for c in chunks]
+        total_chunks = len(texts)
+
+        start_t = time.perf_counter()
+        sparse_vectors = []
+        for i in range(0, total_chunks, batch_size):
+            batch_texts = texts[i : i + batch_size]
+            batch_embs = list(sparse_model.embed(batch_texts))
+            sparse_vectors.extend(batch_embs)
+
+        emb_time = time.perf_counter() - start_t
+        logger.info(f"Generated {total_chunks} sparse embeddings in {emb_time:.2f}s ({total_chunks/emb_time:.1f} vec/s).")
+
+        logger.info(f"Updating sparse vectors in Qdrant collection '{coll_name}'...")
+        updated = indexer.update_sparse_vectors(coll_name, chunk_ids, sparse_vectors)
+        logger.info(f"Updated {updated} points in '{coll_name}'.")
+
+    indexer.close()
 
 
 def index_chunks_with_mapping(
@@ -168,33 +204,35 @@ def index_chunks_with_mapping(
     )
 
 
-def run_evaluation_stage(methods: List[str], model_key: str) -> None:
+def run_evaluation_stage(methods: List[str], model_key: str, mode: str = "hybrid") -> None:
     """Stage 3: Run retrieval benchmark against Gold Test Set."""
     provider = get_provider_config(model_key)
 
-    logger.info(f"=== STAGE 3: RUNNING RETRIEVAL BENCHMARK [{provider['display_name']}] ===")
+    logger.info(f"=== STAGE 3: RUNNING RETRIEVAL BENCHMARK [{mode.upper()} | {provider['display_name']}] ===")
     questions = load_gold_test_set(GOLD_TEST_SET_FILE)
     if not questions:
         logger.error(f"No gold questions found at {GOLD_TEST_SET_FILE}. Please populate test set.")
         return
 
-    evaluator = RetrievalEvaluator()
+    evaluator = RetrievalEvaluator(retrieval_mode=mode)
+    out_dir = OUTPUT_RETRIEVAL / ("v1_hybrid" if mode == "hybrid" else f"v0_{mode}_baseline")
     results = evaluator.run_benchmark(
         gold_questions=questions,
         methods=methods,
         model_key=model_key,
-        output_dir=OUTPUT_RETRIEVAL_ROOT,
+        output_dir=out_dir,
     )
 
     logger.info("=== BENCHMARK COMPLETE ===")
-    logger.info(f"Master report: {OUTPUT_RETRIEVAL_ROOT / 'V0_RETRIEVAL_EVALUATION_REPORT.md'}")
+    report_file = "V1_HYBRID_RETRIEVAL_REPORT.md" if mode == "hybrid" else "V0_RETRIEVAL_EVALUATION_REPORT.md"
+    logger.info(f"Master report: {out_dir / report_file}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FinAnalyst-AI RAG Pipeline Master Runner")
+    parser = argparse.ArgumentParser(description="FinAnalyst-AI RAG Pipeline Master Runner (V1 Hybrid)")
     parser.add_argument(
         "--stage",
-        choices=["all", "embed", "index", "evaluate"],
+        choices=["all", "embed", "index", "index_sparse", "evaluate"],
         default="all",
         help="Stage of the pipeline to execute.",
     )
@@ -211,6 +249,12 @@ def main():
         help=f"Embedding model provider to use (default: '{DEFAULT_EMBEDDING_PROVIDER}').",
     )
     parser.add_argument(
+        "--mode",
+        choices=["hybrid", "dense", "sparse"],
+        default="hybrid",
+        help="Retrieval search mode for evaluation (default: 'hybrid').",
+    )
+    parser.add_argument(
         "--recreate",
         action="store_true",
         help="Recreate Qdrant collections if they already exist.",
@@ -222,9 +266,10 @@ def main():
         m.strip() for m in args.methods.split(",") if m.strip() in CHUNK_METHODS
     ]
     model_key = args.model
+    mode = args.mode
 
     provider = get_provider_config(model_key)
-    logger.info(f"Pipeline config: model={provider['display_name']}, methods={target_methods}")
+    logger.info(f"Pipeline config: model={provider['display_name']}, mode={mode}, methods={target_methods}")
 
     if args.stage in ["all", "embed"]:
         run_embedding_stage(target_methods, model_key)
@@ -232,10 +277,12 @@ def main():
     if args.stage in ["all", "index"]:
         run_indexing_stage(target_methods, model_key, recreate=args.recreate)
 
+    if args.stage in ["all", "index_sparse"]:
+        run_sparse_indexing_stage(target_methods, model_key)
+
     if args.stage in ["all", "evaluate"]:
-        run_evaluation_stage(target_methods, model_key)
+        run_evaluation_stage(target_methods, model_key, mode=mode)
 
 
 if __name__ == "__main__":
     main()
-

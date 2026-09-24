@@ -8,6 +8,7 @@ Supports:
 """
 
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
@@ -120,10 +121,12 @@ class QdrantIndexer:
             },
         )
 
-        # 7 Standardized Payload Indexes
+        # 9 Standardized Payload Indexes (Freeze V0 / Schema B)
         index_fields = [
             ("ticker", PayloadSchemaType.KEYWORD),
+            ("document_id", PayloadSchemaType.KEYWORD),
             ("fiscal_year", PayloadSchemaType.INTEGER),
+            ("period_years", PayloadSchemaType.INTEGER),  # Qdrant supports int array indexing
             ("fiscal_period", PayloadSchemaType.KEYWORD),
             ("statement_type", PayloadSchemaType.KEYWORD),
             ("form_type", PayloadSchemaType.KEYWORD),
@@ -141,14 +144,14 @@ class QdrantIndexer:
             except Exception as e:
                 logger.debug(f"Payload index creation note for '{field_name}': {e}")
 
-        logger.info(f"Collection '{collection_name}' initialized with 7 payload indexes.")
+        logger.info(f"Collection '{collection_name}' initialized with 9 payload indexes.")
 
     @staticmethod
     def build_payload(
         chunk: Dict[str, Any],
         method_key: str,
         embedding_model: str = "BAAI/bge-base-en-v1.5",
-        embedding_version: str = "v0_dense",
+        embedding_version: str = "v1_hybrid",
     ) -> Dict[str, Any]:
         """Construct standardized Qdrant payload with content flags and financial metadata."""
         meta = chunk.get("metadata", {}) or {}
@@ -174,22 +177,50 @@ class QdrantIndexer:
             unit_scale = "million"
 
         statement_type = meta.get("statement_type", "other_financial")
-        ticker = str(chunk.get("ticker", "")).upper()
+        ticker = str(chunk.get("ticker") or meta.get("ticker") or "").upper()
+        if not ticker and chunk.get("chunk_id"):
+            cand = chunk["chunk_id"].split("_")[0].upper()
+            if cand in COMPANY_NAMES_MAP or cand in ["AAPL", "NVDA", "AMZN", "AMD", "INTC", "NKE", "WMT"]:
+                ticker = cand
         company_name = COMPANY_NAMES_MAP.get(ticker, ticker)
+
+        doc_id = str(chunk.get("document_id") or meta.get("document_id") or "").lower()
+        if not doc_id and chunk.get("chunk_id"):
+            parts = str(chunk["chunk_id"]).lower().split("_")
+            if len(parts) >= 2 and re.match(r"^20\d\d$", parts[1]):
+                doc_id = f"{parts[0]}_{parts[1]}_10k"
+
+        # FIX [B2]: Infer fiscal_year from doc_id instead of hardcoding 2025
+        raw_fy = chunk.get("fiscal_year") or meta.get("fiscal_year")
+        if raw_fy is not None and str(raw_fy).isdigit():
+            fiscal_year = int(raw_fy)
+        else:
+            m_fy = re.search(r"\b(20\d\d)\b", doc_id)
+            fiscal_year = int(m_fy.group(1)) if m_fy else 2025
+
+        # FIX [B2]: Extract or infer period_years for multi-year financial statements
+        period_years = meta.get("period_years") or chunk.get("period_years")
+        if not period_years:
+            found_years = {int(y) for y in re.findall(r"\b(20[12]\d)\b", content)}
+            period_years = sorted(list(found_years)) if found_years else [fiscal_year]
+        else:
+            period_years = sorted(list({int(y) for y in period_years if str(y).isdigit()}))
 
         return {
             # --- Primary Identifiers ---
             "chunk_id": chunk.get("chunk_id", ""),
-            "document_id": chunk.get("document_id", ""),
+            "document_id": doc_id,
             "company": company_name,
             "chunk_method": method_key,
             "chunk_type": chunk_type,
-            # --- Indexed Filter Fields (7 Fields) ---
+            # --- Indexed Filter Fields (9 Fields) ---
             "ticker": ticker,
-            "fiscal_year": int(chunk.get("fiscal_year", 2025)),
-            "fiscal_period": "FY",  # V0 Form 10-K baseline, ready for Q1-Q3 in V1
+            "document_id": doc_id,
+            "fiscal_year": fiscal_year,
+            "period_years": period_years,
+            "fiscal_period": str(chunk.get("fiscal_period", "FY")),
             "statement_type": statement_type,
-            "form_type": "10-K",
+            "form_type": str(chunk.get("form_type", "10-K")),
             "contains_table": has_table,
             "contains_text": has_text,
             # --- Extended Payload Fields (Display & Generation Provenance) ---
@@ -216,19 +247,21 @@ class QdrantIndexer:
         chunks: List[Dict[str, Any]],
         vectors: np.ndarray,
         method_key: str,
+        sparse_vectors: Optional[List[Any]] = None,
         embedding_model: str = "BAAI/bge-base-en-v1.5",
-        embedding_version: str = "v0_dense",
+        embedding_version: str = "v1_hybrid",
         batch_size: int = 100,
     ) -> int:
-        """Batch upsert chunks and dense vectors into Qdrant.
+        """Batch upsert chunks and vectors (dense + optional sparse) into Qdrant.
         
         Args:
             collection_name: Name of target collection.
             chunks: List of chunk dictionaries loaded from chunks.jsonl.
             vectors: np.ndarray of shape (N, dim) dense embeddings.
             method_key: Chunking method identifier.
+            sparse_vectors: Optional list of FastEmbed SparseEmbedding objects.
             embedding_model: Identifier of the embedding model used.
-            embedding_version: Version identifier (e.g. 'v0_dense').
+            embedding_version: Version identifier (e.g. 'v1_hybrid').
             batch_size: Number of points to upsert per batch.
 
         Returns:
@@ -249,11 +282,25 @@ class QdrantIndexer:
                 embedding_version=embedding_version,
             )
 
-            # V0 Upsert: Supply ONLY named 'dense' vector; omit 'sparse'
+            vector_dict: Dict[str, Any] = {"dense": dense_vector}
+            if sparse_vectors is not None and i < len(sparse_vectors):
+                s_vec = sparse_vectors[i]
+                if hasattr(s_vec, "indices") and hasattr(s_vec, "values"):
+                    idx = s_vec.indices.tolist() if hasattr(s_vec.indices, "tolist") else list(s_vec.indices)
+                    val = s_vec.values.tolist() if hasattr(s_vec.values, "tolist") else list(s_vec.values)
+                elif isinstance(s_vec, dict):
+                    idx, val = s_vec["indices"], s_vec["values"]
+                else:
+                    idx, val = list(s_vec[0]), list(s_vec[1])
+                vector_dict["sparse"] = rest.SparseVector(
+                    indices=[int(x) for x in idx],
+                    values=[float(x) for x in val],
+                )
+
             points.append(
                 PointStruct(
                     id=p_id,
-                    vector={"dense": dense_vector},
+                    vector=vector_dict,
                     payload=payload,
                 )
             )
@@ -265,6 +312,62 @@ class QdrantIndexer:
             self.client.upsert(collection_name=collection_name, points=batch)
 
         logger.info(f"Indexed {total_points} chunks into collection '{collection_name}'.")
+        return total_points
+
+    def update_sparse_vectors(
+        self,
+        collection_name: str,
+        chunk_ids: List[str],
+        sparse_vectors: List[Any],
+        batch_size: int = 250,
+    ) -> int:
+        """Update or add named 'sparse' vectors for existing points in Qdrant collection.
+        
+        Args:
+            collection_name: Name of target Qdrant collection.
+            chunk_ids: List of chunk_ids corresponding to existing points.
+            sparse_vectors: List of FastEmbed SparseEmbedding objects or dicts with indices & values.
+            batch_size: Batch size for update_vectors calls.
+
+        Returns:
+            Number of points updated.
+        """
+        assert len(chunk_ids) == len(sparse_vectors), (
+            f"chunk_ids count ({len(chunk_ids)}) != sparse_vectors count ({len(sparse_vectors)})"
+        )
+
+        points_to_update: List[rest.PointVectors] = []
+        for cid, s_vec in zip(chunk_ids, sparse_vectors):
+            p_id = generate_point_id(cid)
+            if hasattr(s_vec, "indices") and hasattr(s_vec, "values"):
+                indices = s_vec.indices.tolist() if hasattr(s_vec.indices, "tolist") else list(s_vec.indices)
+                values = s_vec.values.tolist() if hasattr(s_vec.values, "tolist") else list(s_vec.values)
+            elif isinstance(s_vec, dict):
+                indices = s_vec["indices"]
+                values = s_vec["values"]
+            else:
+                indices = list(s_vec[0])
+                values = list(s_vec[1])
+
+            points_to_update.append(
+                rest.PointVectors(
+                    id=p_id,
+                    vector={
+                        "sparse": rest.SparseVector(
+                            indices=[int(idx) for idx in indices],
+                            values=[float(val) for val in values],
+                        )
+                    },
+                )
+            )
+
+        total_points = len(points_to_update)
+        for start_idx in range(0, total_points, batch_size):
+            end_idx = min(start_idx + batch_size, total_points)
+            batch = points_to_update[start_idx:end_idx]
+            self.client.update_vectors(collection_name=collection_name, points=batch)
+
+        logger.info(f"Updated sparse vectors for {total_points} chunks in '{collection_name}'.")
         return total_points
 
     def get_collection_info(self, collection_name: str) -> Dict[str, Any]:
@@ -280,3 +383,8 @@ class QdrantIndexer:
         """Close client connection if applicable."""
         if hasattr(self.client, "close"):
             self.client.close()
+
+
+# Module-level convenience aliases
+build_payload = QdrantIndexer.build_payload
+IndexManager = QdrantIndexer
