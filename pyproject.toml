@@ -1,0 +1,16 @@
+[project]
+name = "finanalyst-ai"
+version = "0.1.0"
+description = "Financial statement parsing, chunking and RAG pipeline."
+requires-python = ">=3.10"
+readme = "docs/parser.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pyright]
+extraPaths = ["src", "scripts"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "scripts"]
+testpaths = ["tests"]

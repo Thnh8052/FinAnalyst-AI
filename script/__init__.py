@@ -1,1 +1,0 @@
-"""Root script package."""
