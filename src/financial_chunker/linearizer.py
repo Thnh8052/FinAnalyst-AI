@@ -13,24 +13,43 @@ TableLinearizer:
 
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, List, Optional
-
-
-def is_group_header_row(row: List[str]) -> bool:
-    if not row:
-        return False
-    first_cell = row[0].strip()
-    if not first_cell:
-        return False
-    rest_cells = [c.strip() for c in row[1:]]
-    return all(c == "" or c == "-" or c == "—" for c in rest_cells)
+from typing import Dict, List, Optional
 
 
 def clean_cell_text(cell: str) -> str:
-    c = str(cell).replace("\n", " ").strip()
-    c = re.sub(r"\s+", " ", c)
-    return c
+    """A1: Chuẩn hoá whitespace siêu tốc bằng split(), không dùng regex."""
+    return " ".join(str(cell).split())
+
+
+def _starts_with_word(s: str, word: str) -> bool:
+    """A6: Kiểm tra từ đứng đầu theo ranh giới từ (word boundary) không dùng regex."""
+    s_clean = s.strip().lower()
+    if not s_clean.startswith(word):
+        return False
+    if len(s_clean) == len(word):
+        return True
+    return not s_clean[len(word)].isalnum()
+
+
+def _is_generic_col_label(label: str) -> bool:
+    """A7: Nhận diện nhãn cột generic (col_1, col2, column1, column_2) không dùng regex."""
+    s = label.strip().lower()
+    for prefix in ("column", "col"):
+        if s.startswith(prefix):
+            rest = s[len(prefix):].lstrip("_").strip()
+            return len(rest) > 0 and rest.isdigit()
+    return False
+
+
+def is_group_header_row(row: List[str]) -> bool:
+    """Bug L1: Nhận diện hàng header nhóm, chặn hàng đơn ô (<= 1 cell)."""
+    if not row or len(row) <= 1:
+        return False
+    first_cell = clean_cell_text(row[0])
+    if not first_cell:
+        return False
+    EMPTY_CELLS = {"", "-", "—", "–", "n/a", "N/A", "$ -", "$-", "$—"}
+    return all(clean_cell_text(c) in EMPTY_CELLS for c in row[1:])
 
 
 def linearize_financial_table(
@@ -64,12 +83,25 @@ def linearize_financial_table(
     if (not any(clean_headers) or len(clean_headers) <= 1) and rows:
         first_row_non_first = [clean_cell_text(c) for c in rows[0][1:]]
         # Nếu dòng đầu chứa năm (vd: 2024, 2023, FY25) hoặc kỳ báo cáo
-        has_year_in_first_row = any(re.search(r"\b(?:FY)?(19|20)\d{2}\b", c, re.I) for c in first_row_non_first if c)
+        has_year_in_first_row = any(
+            any(t.isdigit() and len(t) == 4 and t.startswith(("19", "20")) for t in c.replace("FY", "").split())
+            for c in first_row_non_first if c
+        )
         if has_year_in_first_row:
             clean_headers = [clean_cell_text(c) for c in rows[0]]
             effective_rows = rows[1:]
 
-    # 2. Xây dựng nhãn cột (col_labels) với fallback thông minh theo period_dates / fiscal_year
+    # Bug #3: Sắp xếp period_dates GIẢM DẦN để khớp thứ tự 10-K (current year first: 2024 -> 2023 -> 2022)
+    desc_dates = sorted(period_dates, reverse=True) if period_dates else []
+
+    # Bug L2: Bằng chứng cột thời gian: desc_dates có phần tử HOẶC header có chứa số năm 19xx/20xx
+    has_temporal_headers = any(
+        any(token.isdigit() and len(token) == 4 and token.startswith(("19", "20"))
+            for token in clean_cell_text(h).split())
+        for h in clean_headers
+    ) or bool(desc_dates)
+
+    # 2. Xây dựng nhãn cột (col_labels) với fallback thông minh
     col_labels: List[str] = []
     num_cols = len(effective_rows[0]) - 1 if effective_rows and len(effective_rows[0]) > 1 else 0
 
@@ -80,12 +112,15 @@ def linearize_financial_table(
             label = clean_headers[c_idx + 1].strip()
 
         # Ưu tiên 2: Nếu nhãn rỗng hoặc dạng generic (Col_1), sử dụng period_dates quan sát được
-        if not label or re.match(r"^col_?\d+$", label, re.I):
-            if period_dates and c_idx < len(period_dates):
-                label = period_dates[c_idx]
-            else:
-                # Ưu tiên 3: Suy luận theo niên độ tài chính giảm dần (FY2025, FY2024...)
+        if not label or _is_generic_col_label(label):
+            if desc_dates and c_idx < len(desc_dates):
+                label = desc_dates[c_idx]
+            elif has_temporal_headers:
+                # Ưu tiên 3: Suy luận theo niên độ tài chính giảm dần khi có bằng chứng thời gian
                 label = f"FY{fiscal_year - c_idx}"
+            else:
+                # Ưu tiên 4 (Bug L2): Không bịa năm nếu là bảng danh mục
+                label = f"Category_{c_idx + 1}"
 
         col_labels.append(label)
 
@@ -107,8 +142,8 @@ def linearize_financial_table(
             lines.append(f"\n--- Category: {current_parent_label} ---")
             continue
 
-        # Kiểm tra reset khi gặp dòng Total
-        is_total_row = bool(re.match(r"^total\b", raw_label, re.I))
+        # Kiểm tra reset khi gặp dòng Total / Subtotal (A6)
+        is_total_row = _starts_with_word(raw_label, "total") or _starts_with_word(raw_label, "subtotal")
 
         # Phân cấp cha - con
         if current_parent_label and not is_total_row:

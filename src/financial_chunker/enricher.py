@@ -23,6 +23,7 @@ Ghi chú về has_table_fragmentation:
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +33,7 @@ from typing import Any, Dict, List, Optional
 SCHEMA_VERSION = "v0.1.0-frozen-2026-09"
 SCHEMA_FROZEN_AT = "2026-09-23"
 
-CONTAINS_TEXT_MIN_WORDS = 30
+CONTAINS_TEXT_MIN_WORDS = 15
 CONTAINS_TABLE_MIN_TABLE_LINES = 2
 WORD_COUNT_METHOD = "whitespace_split"
 
@@ -112,12 +113,12 @@ FISCAL_YEAR_END_MAP = {
 }
 
 COVER_FISCAL_DATE_PATTERN = re.compile(
-    r"for the (?:fiscal\s+year|quarterly\s+period|period)\s+ended\s+([A-Za-z]+)\s+([0-9]{1,2}),?\s*(20\d{2})?",
+    r"for the (?:fiscal\s+year|quarterly\s+period|period)\s+ended\s+([A-Za-z]+)\s+([0-9]{1,2}(?:st|nd|rd|th)?),?\s*((?:19|20)\d{2})?",
     re.I,
 )
 
 STATEMENT_FISCAL_DATE_PATTERN = re.compile(
-    r"(?:years?|period)\s+ended\s+([A-Za-z]+)\s+([0-9]{1,2}),?\s*(20\d{2})?",
+    r"(?:years?|period)\s+ended\s+([A-Za-z]+)\s+([0-9]{1,2}(?:st|nd|rd|th)?),?\s*((?:19|20)\d{2})?",
     re.I,
 )
 
@@ -153,7 +154,8 @@ def detect_document_fiscal_calendar(pages_data: List[Dict[str, Any]]) -> Optiona
             month_str = m.group(1).lower()
             if month_str in MONTH_MAP:
                 m_num = MONTH_MAP[month_str]
-                d_num = f"{int(m.group(2)):02d}"
+                day_digits = "".join(ch for ch in m.group(2) if ch.isdigit())
+                d_num = f"{int(day_digits):02d}"
                 return f"-{m_num}-{d_num}"
 
     # Tầng 2: Quét tiêu đề Báo cáo tài chính (Financial Statement Headers)
@@ -162,12 +164,15 @@ def detect_document_fiscal_calendar(pages_data: List[Dict[str, Any]]) -> Optiona
         blocks = page_obj.get("blocks", [])
         for b in blocks:
             b_text = str(b.get("text", "")).replace("\xa0", " ").replace("\\xa0", " ")
+            if len(b_text) > 200:  # ✅ Bug #7: Bỏ qua đoạn văn tự sự dài trong MD&A
+                continue
             m = STATEMENT_FISCAL_DATE_PATTERN.search(b_text)
             if m:
                 month_str = m.group(1).lower()
                 if month_str in MONTH_MAP:
                     m_num = MONTH_MAP[month_str]
-                    d_num = f"{int(m.group(2)):02d}"
+                    day_digits = "".join(ch for ch in m.group(2) if ch.isdigit())
+                    d_num = f"{int(day_digits):02d}"
                     return f"-{m_num}-{d_num}"
 
     return None
@@ -179,33 +184,34 @@ def parse_iso_date(
     fiscal_date_suffix: Optional[str] = None,
 ) -> Optional[str]:
     s = raw_date_str.strip()
-    # 1. Định dạng YYYY-MM-DD
-    m_iso = re.search(r"\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b", s)
+    # 1. Định dạng YYYY-MM-DD (group 1=year, 2=month, 3=day)
+    m_iso = re.search(r"\b((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b", s)
     if m_iso:
         return f"{m_iso.group(1)}-{m_iso.group(2)}-{m_iso.group(3)}"
 
-    # 2. Định dạng Month Day, Year (vd: Jan 26, 2025 hoặc January 26, 2025)
+    # 2. Định dạng Month Day, Year (vd: Jan 26, 2025 hoặc January 15th, 1999) (group 1=month, 2=day, 3=year)
     m_text = re.search(
-        r"\b([A-Za-z]+)\s+([0-9]{1,2}),\s*(20\d{2})\b", s
+        r"\b([A-Za-z]+)\s+([0-9]{1,2}(?:st|nd|rd|th)?),?\s*((?:19|20)\d{2})\b", s
     )
     if m_text:
         month_name = m_text.group(1).lower()
         if month_name in MONTH_MAP:
             m_num = MONTH_MAP[month_name]
-            d_num = f"{int(m_text.group(2)):02d}"
+            day_digits = "".join(ch for ch in m_text.group(2) if ch.isdigit())
+            d_num = f"{int(day_digits):02d}"
             y_num = m_text.group(3)
             return f"{y_num}-{m_num}-{d_num}"
 
-    # 3. Định dạng MM/DD/YYYY
-    m_slash = re.search(r"\b(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/(20\d{2})\b", s)
+    # 3. Định dạng MM/DD/YYYY (group 1=month, 2=day, 3=year)
+    m_slash = re.search(r"\b(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/((?:19|20)\d{2})\b", s)
     if m_slash:
         m_num = f"{int(m_slash.group(1)):02d}"
         d_num = f"{int(m_slash.group(2)):02d}"
         y_num = m_slash.group(3)
         return f"{y_num}-{m_num}-{d_num}"
 
-    # 4. Chỉ có năm (vd: 2025 hoặc FY2025) -> Dùng fiscal_date_suffix động, fallback ticker map, cuối cùng là -12-31
-    m_year = re.search(r"\b(?:FY)?(20\d{2})\b", s, re.I)
+    # 4. Chỉ có năm (vd: 1999, 2025 hoặc FY2025) (group 1=year)
+    m_year = re.search(r"\b(?:FY)?((?:19|20)\d{2})\b", s, re.I)
     if m_year:
         year_str = m_year.group(1)
         if fiscal_date_suffix:
@@ -217,6 +223,12 @@ def parse_iso_date(
         return f"{year_str}{fy_suffix}"
 
     return None
+
+
+_PERIOD_SPLIT_PAT = re.compile(
+    r"\s*(?:;\s*|\bvs\.?|\band\b|\s[-–]\s|(?<=(?:19|20)\d{2}),\s*)\s*",
+    re.I,
+)
 
 
 def extract_iso_dates_from_period(
@@ -237,8 +249,11 @@ def extract_iso_dates_from_period(
                     dates.append(iso)
         raw = period_data.get("raw", "")
         if raw:
-            for part in re.split(r"[,;vs\-\–]", str(raw)):
-                iso = parse_iso_date(part, ticker=ticker, fiscal_date_suffix=fiscal_date_suffix)
+            for part in _PERIOD_SPLIT_PAT.split(str(raw)):
+                p = part.strip()
+                if not p:
+                    continue
+                iso = parse_iso_date(p, ticker=ticker, fiscal_date_suffix=fiscal_date_suffix)
                 if iso and iso not in dates:
                     dates.append(iso)
     elif isinstance(period_data, list):
@@ -285,6 +300,14 @@ def parse_unit_metadata(unit_data: Any) -> Dict[str, str]:
     return {"currency": currency, "scale": scale, "raw": raw_str}
 
 
+def _is_separator_line(line: str) -> bool:
+    """A5: Nhận diện dòng phân cách ASCII (+---+, ----) không dùng regex."""
+    s = line.strip()
+    if len(s) < 3:
+        return False
+    return set(s) <= {"+", "-", "|", ":", " "}
+
+
 def compute_content_flags(
     chunk_text: str,
     chunk_type: str = "",
@@ -308,7 +331,7 @@ def compute_content_flags(
          -> Loại bỏ dòng cấu trúc bảng Markdown ('|...|', '+---', '|---').
          -> Loại bỏ metadata prefix do hệ thống gắn (theo danh sách EXCLUDED_PREFIXES).
          -> Đếm số từ tự sự bằng whitespace split: len(narrative_text.split()).
-         -> contains_text = (narrative_word_count >= narrative_word_threshold, mặc định 30 từ).
+         -> contains_text = (narrative_word_count >= narrative_word_threshold, mặc định 15 từ).
          
     Kết quả:
     - (True, False) : Bảng thuần túy (Pure Table) -> Lọc trúng các báo cáo tài chính lớn
@@ -333,7 +356,7 @@ def compute_content_flags(
         l for l in lines
         if not l.strip().startswith("|")
         and not any(l.strip().startswith(p) for p in excluded_prefixes)
-        and not re.match(r"^\s*[+|\-]{3,}", l.strip())
+        and not _is_separator_line(l)
     ]
     
     narrative_text = " ".join(text_lines).strip()

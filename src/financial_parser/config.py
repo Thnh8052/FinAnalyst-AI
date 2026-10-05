@@ -14,7 +14,7 @@ from finanalyst.paths import OUTPUT_PARSER_DEFAULT
 class ParserConfig:
     """Configuration shared by the profiler, parser engines and quality gates."""
 
-    vlm_provider: str = "auto"  # "auto" | "llamaparse" | "deepseek" | "gemini" | "local"
+    vlm_provider: str = "auto"  # "auto" | "llamaparse" | "deepseek" | "gemini" | "local" | "groq" | "openrouter"
     llamaparse_api_key: str = ""
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -23,6 +23,10 @@ class ParserConfig:
     vlm_concurrency: int = 4
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
+    groq_api_key: str = ""
+    groq_model: str = "qwen/qwen3.8-27b"
+    openrouter_api_key: str = ""
+    openrouter_model: str = "stealth/space-bunny-alpha"
     render_dpi: int = 230
     docling_timeout_seconds: int = 600
     min_native_chars: int = 80
@@ -42,6 +46,7 @@ class ParserConfig:
     max_narrative_numbers: int = 8
     max_cross_page_token_ratio: float = 0.05
     output_root: Path = OUTPUT_PARSER_DEFAULT
+    save_intermediate_images: bool = False
 
     def __post_init__(self):
         # Sync values when aliases are explicitly overridden
@@ -79,6 +84,7 @@ class ParserConfig:
         deepseek_model: Optional[str] = None,
         render_dpi: Optional[int] = None,
         vlm_concurrency: Optional[int] = None,
+        save_intermediate_images: Optional[bool] = None,
     ) -> "ParserConfig":
         """Load optional values without exposing API keys in logs or manifests."""
         try:
@@ -89,7 +95,7 @@ class ParserConfig:
             pass
 
         active_provider = (vlm_provider or os.getenv("VLM_PROVIDER", "auto")).strip().lower()
-        if active_provider not in ("auto", "llamaparse", "deepseek", "gemini", "local"):
+        if active_provider not in ("auto", "llamaparse", "deepseek", "gemini", "local", "groq", "openrouter"):
             active_provider = "auto"
 
         ds_model = (
@@ -102,8 +108,19 @@ class ParserConfig:
             or gemini_model
             or os.getenv("GEMINI_MODEL", "gemini-flash-latest")
         ).strip()
+        gq_model = (
+            (vlm_model if active_provider == "groq" else None)
+            or os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+        ).strip()
+        or_model = (
+            (vlm_model if active_provider == "openrouter" else None)
+            or os.getenv("OPENROUTER_MODEL", "stealth/space-bunny-alpha")
+        ).strip()
 
         concurrency = vlm_concurrency or int(os.getenv("VLM_CONCURRENCY", "4"))
+        save_images_env = os.getenv("FINANCIAL_PARSER_SAVE_IMAGES", "").strip().lower()
+        default_save_images = save_images_env in ("1", "true", "yes") if save_images_env else False
+        final_save_images = save_intermediate_images if save_intermediate_images is not None else default_save_images
 
         return cls(
             vlm_provider=active_provider,
@@ -115,8 +132,13 @@ class ParserConfig:
             vlm_concurrency=max(1, concurrency),
             gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
             gemini_model=gem_model,
+            groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
+            groq_model=gq_model,
+            openrouter_api_key=os.getenv("OPEN_ROUTER_API_KEY", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip(),
+            openrouter_model=or_model,
             render_dpi=render_dpi or int(os.getenv("FINANCIAL_PARSER_DPI", "230")),
             output_root=output_root or Path(os.getenv("FINANCIAL_PARSER_OUT", "output_financial_parser")),
+            save_intermediate_images=final_save_images,
         )
 
 

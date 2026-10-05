@@ -341,6 +341,205 @@ Ignore only non-data decorative stamps/signatures. Include `<!-- PRINTED_PAGE: N
             raise EngineExecutionError(f"Local VLM failed on page {pdf_page}: {error}") from error
 
 
+class OpenRouterVisionAdapter:
+    """Vision adapter communicating with OpenRouter multimodal API."""
+
+    SYSTEM_PROMPT = """You transcribe one page from a financial report (VAS, IFRS, or SEC filing).
+Return only faithful GitHub-flavored Markdown. Do not summarize, calculate, infer, translate, or correct values.
+Transcribe all visible labels, footnotes, units, reporting periods, and table cells.
+Preserve a nil hyphen ('-'), zero ('0'), blank cells, parentheses for negative values, and the original language.
+Use a Markdown pipe table when the source contains a table. For multi-level headers, make each output column header explicit.
+Ignore only non-data decorative stamps/signatures. Include `<!-- PRINTED_PAGE: N -->` only when N is visibly printed.
+"""
+
+    def __init__(self, config: ParserConfig) -> None:
+        self.config = config
+
+    @staticmethod
+    def available(config: ParserConfig) -> bool:
+        return bool(config.openrouter_api_key)
+
+    def _call_openrouter_api(self, image_bytes: bytes, pdf_page: int) -> str:
+        try:
+            import requests
+        except ImportError as error:
+            raise EngineUnavailableError("requests is not installed. Install requirements-parsing.txt.") from error
+
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        endpoint = "https://openrouter.ai/api/v1/chat/completions"
+        payload = {
+            "model": self.config.openrouter_model,
+            "messages": [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Transcribe PDF page index: {pdf_page} into faithful Markdown with pipe tables."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+                    ],
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": self.config.vlm_max_tokens,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.openrouter_api_key}",
+            "HTTP-Referer": "https://github.com/FinAnalyst-AI",
+            "X-Title": "FinAnalyst-AI Financial Parser",
+        }
+        last_error = "unknown API error"
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+            except requests.RequestException as error:
+                last_error = str(error)
+            else:
+                if response.status_code == 200:
+                    body = response.json()
+                    choices = body.get("choices", [])
+                    if choices:
+                        msg = choices[0].get("message", {})
+                        raw_content = msg.get("content") or msg.get("reasoning_content")
+                        content = (raw_content or "").strip()
+                        if content:
+                            return content
+                    last_error = "API response contains no text choice or content was empty"
+                elif response.status_code not in (429, 500, 502, 503, 504):
+                    raise EngineExecutionError(f"OpenRouter returned HTTP {response.status_code}: {response.text[:500]}")
+                else:
+                    last_error = f"OpenRouter returned HTTP {response.status_code}"
+            time.sleep(2 ** attempt)
+        raise EngineExecutionError(f"OpenRouter failed for PDF page {pdf_page}: {last_error}")
+
+    def parse_page(self, page: Any, pdf_page: int) -> str:
+        if not self.config.openrouter_api_key:
+            raise EngineUnavailableError("OPEN_ROUTER_API_KEY is required for OpenRouter VLM-routed pages.")
+        try:
+            pixmap = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
+            image_bytes = pixmap.tobytes("jpeg")
+        except Exception as error:
+            raise EngineExecutionError(f"Could not render PDF page {pdf_page}: {error}") from error
+        return self._call_openrouter_api(image_bytes, pdf_page)
+
+    def parse_batch(self, pdf_path: Path, page_numbers: List[int]) -> Dict[int, str]:
+        if not self.config.openrouter_api_key:
+            raise EngineUnavailableError("OPEN_ROUTER_API_KEY is required for OpenRouter VLM-routed pages.")
+        try:
+            import pymupdf as fitz
+            from concurrent.futures import ThreadPoolExecutor
+        except ImportError as error:
+            raise EngineUnavailableError("pymupdf is required for OpenRouter batch processing.") from error
+
+        parsed: Dict[int, str] = {}
+        rendered_images: Dict[int, bytes] = {}
+
+        doc = fitz.open(pdf_path)
+        try:
+            for p_num in page_numbers:
+                if 1 <= p_num <= len(doc):
+                    page = doc[p_num - 1]
+                    pix = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
+                    rendered_images[p_num] = pix.tobytes("jpeg")
+        finally:
+            doc.close()
+
+        def _worker(p_num: int) -> Tuple[int, str]:
+            return p_num, self._call_openrouter_api(rendered_images[p_num], p_num)
+
+        workers = min(len(rendered_images), max(1, self.config.vlm_concurrency))
+        print(f"      [OpenRouter] Processing batch of {len(rendered_images)} pages with {workers} concurrent workers...", flush=True)
+
+        if workers <= 1:
+            for p_num in page_numbers:
+                if p_num in rendered_images:
+                    parsed[p_num] = self._call_openrouter_api(rendered_images[p_num], p_num)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_worker, p) for p in page_numbers if p in rendered_images]
+                for fut in futures:
+                    p_num, md = fut.result()
+                    parsed[p_num] = md
+
+        return parsed
+
+
+class GroqVisionAdapter:
+    """Vision adapter communicating with Groq LPU multimodal API."""
+
+    SYSTEM_PROMPT = """You transcribe one page from a financial report (VAS, IFRS, or SEC filing).
+Return only faithful GitHub-flavored Markdown. Do not summarize, calculate, infer, translate, or correct values.
+Transcribe all visible labels, footnotes, units, reporting periods, and table cells.
+Preserve a nil hyphen ('-'), zero ('0'), blank cells, parentheses for negative values, and the original language.
+Use a Markdown pipe table when the source contains a table. For multi-level headers, make each output column header explicit.
+Ignore only non-data decorative stamps/signatures. Include `<!-- PRINTED_PAGE: N -->` only when N is visibly printed.
+"""
+
+    def __init__(self, config: ParserConfig) -> None:
+        self.config = config
+
+    @staticmethod
+    def available(config: ParserConfig) -> bool:
+        return bool(config.groq_api_key)
+
+    def parse_page(self, page: Any, pdf_page: int) -> str:
+        if not self.config.groq_api_key:
+            raise EngineUnavailableError("GROQ_API_KEY is required for Groq VLM-routed pages.")
+        try:
+            import requests
+        except ImportError as error:
+            raise EngineUnavailableError("requests is not installed. Install requirements-parsing.txt.") from error
+
+        try:
+            pixmap = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
+            image_bytes = pixmap.tobytes("jpeg")
+        except Exception as error:
+            raise EngineExecutionError(f"Could not render PDF page {pdf_page}: {error}") from error
+
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        endpoint = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": self.config.groq_model,
+            "messages": [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Transcribe PDF page index: {pdf_page} into faithful Markdown with pipe tables."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+                    ],
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": self.config.vlm_max_tokens,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.groq_api_key}",
+        }
+        last_error = "unknown API error"
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+            except requests.RequestException as error:
+                last_error = str(error)
+            else:
+                if response.status_code == 200:
+                    body = response.json()
+                    choices = body.get("choices", [])
+                    if choices:
+                        content = choices[0].get("message", {}).get("content", "").strip()
+                        if content:
+                            return content
+                    last_error = "API response contains no text choice"
+                elif response.status_code not in (429, 500, 502, 503, 504):
+                    raise EngineExecutionError(f"Groq returned HTTP {response.status_code}: {response.text[:500]}")
+                else:
+                    last_error = f"Groq returned HTTP {response.status_code}"
+            time.sleep(2 ** attempt)
+        raise EngineExecutionError(f"Groq failed for PDF page {pdf_page}: {last_error}")
+
+
 class LlamaParseVisionAdapter:
     """Vision adapter communicating with LlamaParse API V2 for complex financial tables."""
 
@@ -428,15 +627,59 @@ class VLMPdfParser(BaseParser):
         super().__init__(config)
         self.adapters = []
         
-        # Add adapters in order of priority based on config
-        if config.vlm_provider in ("llamaparse", "auto"):
-            self.adapters.append(LlamaParseVisionAdapter(config))
-        if config.vlm_provider in ("deepseek", "auto"):
-            self.adapters.append(DeepSeekVisionAdapter(config))
-        if config.vlm_provider in ("gemini", "auto"):
-            self.adapters.append(GeminiVisionAdapter(config))
-        if config.vlm_provider in ("local", "auto"):
-            self.adapters.append(LocalHFVisionAdapter(config))
+        # 1. Primary provider based on config
+        provider = config.vlm_provider.lower()
+        primary_adapter_map = {
+            "openrouter": OpenRouterVisionAdapter,
+            "groq": GroqVisionAdapter,
+            "deepseek": DeepSeekVisionAdapter,
+            "gemini": GeminiVisionAdapter,
+            "llamaparse": LlamaParseVisionAdapter,
+            "local": LocalHFVisionAdapter,
+        }
+        
+        if provider in primary_adapter_map:
+            self.adapters.append(primary_adapter_map[provider](config))
+            
+        # 2. Always chain fallback adapters in resilience order (if not already added as primary)
+        if provider == "openrouter":
+            all_fallback_classes = [
+                DeepSeekVisionAdapter,
+                GeminiVisionAdapter,
+                GroqVisionAdapter,
+            ]
+        elif provider == "groq":
+            all_fallback_classes = [
+                OpenRouterVisionAdapter,
+                DeepSeekVisionAdapter,
+                GeminiVisionAdapter,
+            ]
+        elif provider == "deepseek":
+            all_fallback_classes = [
+                OpenRouterVisionAdapter,
+                GeminiVisionAdapter,
+                GroqVisionAdapter,
+            ]
+        elif provider == "gemini":
+            all_fallback_classes = [
+                OpenRouterVisionAdapter,
+                DeepSeekVisionAdapter,
+                GroqVisionAdapter,
+            ]
+        else:
+            all_fallback_classes = [
+                DeepSeekVisionAdapter,
+                OpenRouterVisionAdapter,
+                GeminiVisionAdapter,
+                GroqVisionAdapter,
+                LlamaParseVisionAdapter,
+                LocalHFVisionAdapter,
+            ]
+        added_types = {type(a) for a in self.adapters}
+        for adapter_cls in all_fallback_classes:
+            if adapter_cls not in added_types:
+                self.adapters.append(adapter_cls(config))
+                added_types.add(adapter_cls)
 
     def is_available(self) -> bool:
         return any(adapter.available(self.config) for adapter in self.adapters)
@@ -539,7 +782,14 @@ class ParserFactory:
         engine_enum = EngineName(engine) if isinstance(engine, str) else engine
         if engine_enum == EngineName.DOCLING:
             return DoclingParser(config)
-        elif engine_enum in (EngineName.DEEPSEEK_VLM, EngineName.GEMINI_VLM, EngineName.LOCAL_VLM):
+        elif engine_enum in (
+            EngineName.DEEPSEEK_VLM,
+            EngineName.GEMINI_VLM,
+            EngineName.LOCAL_VLM,
+            EngineName.OPENROUTER_VLM,
+            EngineName.GROQ_VLM,
+            EngineName.LLAMAPARSE_VLM,
+        ):
             return VLMPdfParser(config)
         elif engine_enum == EngineName.TATR:
             return TATRTableParser(config)
@@ -554,5 +804,7 @@ class ParserFactory:
 DoclingEngine = DoclingParser
 DeepSeekVisionEngine = VLMPdfParser
 GeminiVisionEngine = VLMPdfParser
+OpenRouterVisionEngine = OpenRouterVisionAdapter
+GroqVisionEngine = GroqVisionAdapter
 create_vlm_engine = ParserFactory.create_vlm_parser
 
