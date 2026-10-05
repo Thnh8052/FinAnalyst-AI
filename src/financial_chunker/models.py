@@ -28,8 +28,10 @@ class ChunkType(str, Enum):
     TABLE_ATOMIC = "table_atomic"
     TABLE_SUBGROUP = "table_subgroup"
     NARRATIVE_SECTION = "narrative_section"
+    PARENT_SECTION = "parent_section"
     DOCUMENT_SUMMARY = "document_summary"
     CROSS_REFERENCE_INDEX = "cross_reference_index"
+    TABLE_OF_CONTENTS = "table_of_contents"
 
 
 @dataclass
@@ -84,6 +86,9 @@ class FinancialChunk:
     token_count: int
     source_pages: List[int]
     has_table_fragmentation: bool = False
+    chunk_level: str = "child"                             # "parent", "child", "tier0"
+    parent_chunk_id: Optional[str] = None                  # Trỏ lên Parent Chunk (nếu là child)
+    child_chunk_ids: List[str] = field(default_factory=list) # Trỏ xuống các Child (nếu là parent)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

@@ -78,12 +78,8 @@ def find_sec_filings(
 
 
 def get_doc_output_name(pdf_path: Path) -> str:
-    """Generate canonical directory name: e.g., amazon_2021_10k."""
-    stem = pdf_path.stem.lower()
-    # Normalize naming like amazon_2021 or intel_2024
-    if not stem.endswith("_10k"):
-        return f"{stem}_10k"
-    return stem
+    """Generate canonical directory name: e.g., bestbuy_2024q2_10q or amazon_2021_10k."""
+    return pdf_path.stem.lower()
 
 
 def parse_all_filings(
@@ -96,8 +92,9 @@ def parse_all_filings(
     """Run parser on all PDF files sequentially."""
     total = len(pdf_files)
     print(f"\n=======================================================", flush=True)
-    print(f"🚀 BẮT ĐẦU BATCH PARSING: {total} TÀI LIỆU SEC 10-K", flush=True)
+    print(f"🚀 BẮT ĐẦU PIPELINE PARSING: {total} TÀI LIỆU SEC", flush=True)
     print(f"📁 Thư mục output: {output_root}", flush=True)
+    print(f"🤖 VLM Provider: {config.vlm_provider} | Model: {config.openrouter_model if config.vlm_provider == 'openrouter' else (config.groq_model if config.vlm_provider == 'groq' else 'default')}", flush=True)
     print(f"⚙️ Chế độ: force={force}, dry_run={dry_run}", flush=True)
     print(f"=======================================================\n", flush=True)
 
@@ -117,10 +114,11 @@ def parse_all_filings(
         is_completed = pages_dir.exists() and any(pages_dir.glob("page_*.json"))
         
         if is_completed and not force:
-            print(f"  ⏭️ Đã tồn tại kết quả hoàn chỉnh tại {doc_out}. Bỏ qua (dùng --force để parse lại).", flush=True)
+            print(f"  ⏭️ [{idx}/{total}] Đã tồn tại kết quả hoàn chỉnh tại {doc_out}. Bỏ qua (dùng --force để parse lại).", flush=True)
             skipped += 1
             continue
 
+        print(f"  📄 [{idx}/{total}] Đang xử lý: {pdf_path.name} ...", flush=True)
         start_time = time.time()
         try:
             summary = router.process(
@@ -130,10 +128,21 @@ def parse_all_filings(
                 dry_run=dry_run,
             )
             elapsed = time.time() - start_time
-            print(f"  ✅ Hoàn tất trong {elapsed:.1f}s | "
-                  f"Pages: {summary.get('total_pages_manifest', 0)} | "
-                  f"Recall: {summary.get('avg_source_text_recall', 0):.1%} | "
-                  f"Review Queue: {summary.get('review_queue_count', 0)}", flush=True)
+            if dry_run:
+                pages_cnt = summary.get("pages_profiled", 0)
+                classes = summary.get("classes", {})
+                print(f"  🔍 [DRY-RUN] Đã quét {pages_cnt} trang trong {elapsed:.1f}s | Phân loại: {classes}", flush=True)
+            else:
+                processed_map = summary.get("processed", {})
+                pages_cnt = len(processed_map)
+                engines = summary.get("engine_counts", {})
+                qc_summary = summary.get("qc_counts", {})
+                review_cnt = summary.get("review_queue_count", 0)
+                print(f"  ✅ Hoàn tất {pdf_path.name} trong {elapsed:.1f}s | "
+                      f"Pages: {pages_cnt} | "
+                      f"Engines: {engines} | "
+                      f"QC: {qc_summary} | "
+                      f"Review Queue: {review_cnt}", flush=True)
             
             # Generate markdown report
             if not dry_run:
@@ -152,22 +161,35 @@ def parse_all_filings(
             gc.collect()
 
     print(f"\n=======================================================", flush=True)
-    print(f"🏁 TỔNG KẾT BATCH PARSING", flush=True)
+    print(f"🏁 TỔNG KẾT PIPELINE PARSING", flush=True)
     print(f"Tổng số file: {total} | Hoàn tất: {completed} | Đã có sẵn: {skipped} | Lỗi: {failed}", flush=True)
     print(f"=======================================================\n", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Batch parse SEC Form 10-K filings into canonical JSON.")
+    parser = argparse.ArgumentParser(description="Parse SEC Form 10-K / 10-Q filings into canonical JSON.")
+    parser.add_argument("--file", type=Path, default=None, help="Parse a single specific PDF file directly.")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR / "sec_filings", help="Base directory containing SEC filings.")
     parser.add_argument("--out", type=Path, default=OUTPUT_PARSING, help="Output root directory.")
     parser.add_argument("--companies", nargs="+", default=None, help="Filter specific companies (e.g. apple intel nvda).")
     parser.add_argument("--years", nargs="+", type=int, default=None, help="Filter specific years (e.g. 2024 2025).")
-    parser.add_argument("--provider", choices=["deepseek", "gemini", "llamaparse", "auto"], default=None, help="VLM provider.")
-    parser.add_argument("--model", default=None, help="VLM model name override.")
+    parser.add_argument("--provider", choices=["openrouter", "groq", "deepseek", "gemini", "llamaparse", "auto"], default="openrouter", help="VLM provider.")
+    parser.add_argument("--model", default=None, help="VLM model override (default: stealth/space-bunny-alpha for openrouter, qwen/qwen3.8-27b for groq).")
     parser.add_argument("--force", action="store_true", help="Reprocess even if canonical JSON exists.")
     parser.add_argument("--dry-run", action="store_true", help="Profile and manifest only; no heavy extraction.")
     parser.add_argument("--no-vlm", action="store_true", help="Disable VLM calls.")
+    parser.add_argument(
+        "--save-images",
+        action="store_true",
+        default=False,
+        help="Enable saving intermediate page PNG images for review/flawed pages (default: False to save disk space).",
+    )
+    parser.add_argument(
+        "--no-images",
+        dest="save_images",
+        action="store_false",
+        help="Explicitly disable saving intermediate page PNG images (default behavior).",
+    )
     return parser
 
 
@@ -177,6 +199,7 @@ def main() -> int:
         output_root=args.out,
         vlm_provider=args.provider,
         vlm_model=args.model,
+        save_intermediate_images=args.save_images,
     )
     if args.no_vlm:
         config = replace(
@@ -185,11 +208,21 @@ def main() -> int:
             llamaparse_api_key="",
             deepseek_api_key="",
             gemini_api_key="",
+            groq_api_key="",
+            openrouter_api_key="",
         )
 
-    pdf_files = find_sec_filings(args.data_dir, companies=args.companies, years=args.years)
+    if args.file:
+        file_path = args.file.resolve()
+        if not file_path.exists():
+            print(f"❌ File không tồn tại: {file_path}")
+            return 1
+        pdf_files = [file_path]
+    else:
+        pdf_files = find_sec_filings(args.data_dir, companies=args.companies, years=args.years)
+        
     if not pdf_files:
-        print(f"Không tìm thấy file PDF nào trong {args.data_dir} với bộ lọc đã chọn.")
+        print(f"Không tìm thấy file PDF nào với bộ lọc đã chọn.")
         return 0
 
     parse_all_filings(

@@ -21,6 +21,8 @@ class EngineName(str, Enum):
     GEMINI_VLM = "gemini_vlm"
     LOCAL_VLM = "local_vlm"
     LLAMAPARSE_VLM = "llamaparse_vlm"
+    GROQ_VLM = "groq_vlm"
+    OPENROUTER_VLM = "openrouter_vlm"
     TATR = "tatr"
     MANUAL_REVIEW = "manual_review"
 

@@ -79,17 +79,18 @@ class FinancialReportRouter:
             self.vlm_engine_name = EngineName.DEEPSEEK_VLM
         elif config.vlm_provider == "local":
             self.vlm_engine_name = EngineName.LOCAL_VLM
+        elif config.vlm_provider == "openrouter" or (config.vlm_provider == "auto" and config.openrouter_api_key):
+            self.vlm_engine_name = EngineName.OPENROUTER_VLM
+        elif config.vlm_provider == "groq" or (config.vlm_provider == "auto" and config.groq_api_key):
+            self.vlm_engine_name = EngineName.GROQ_VLM
         else:
             self.vlm_engine_name = EngineName.LLAMAPARSE_VLM
         self.orphan_recoverer = OrphanTextRecoverer()
 
     def _initial_route(self, profile: PageProfile) -> RouteDecision:
-        if profile.page_class == PageClass.NATIVE_TEXT:
-            return RouteDecision(profile.pdf_page, EngineName.DOCLING, list(profile.reasons))
-        if profile.page_class == PageClass.UNCERTAIN and profile.char_count < 40 and profile.max_image_coverage < 0.05:
-            # Blank or near-blank separator page: keep on native path ($0 cost) to avoid wasting VLM tokens
-            return RouteDecision(profile.pdf_page, EngineName.DOCLING, list(profile.reasons))
-        return RouteDecision(profile.pdf_page, self.vlm_engine_name, list(profile.reasons))
+        if profile.page_class in (PageClass.HYBRID, PageClass.IMAGE_ONLY):
+            return RouteDecision(profile.pdf_page, self.vlm_engine_name, list(profile.reasons))
+        return RouteDecision(profile.pdf_page, EngineName.DOCLING, list(profile.reasons))
 
     @staticmethod
     def _write_json(path: Path, value: Any) -> None:
@@ -128,7 +129,7 @@ class FinancialReportRouter:
 
         is_flawed = self._is_flawed_page(qc, route)
         source_image_rel: Optional[str] = None
-        if is_flawed:
+        if is_flawed and self.config.save_intermediate_images:
             try:
                 pixmap = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
                 pixmap.save(str(image_path))
@@ -136,7 +137,7 @@ class FinancialReportRouter:
             except Exception:
                 source_image_rel = None
         elif image_path.exists():
-            # If the page passed cleanly, do not keep old flawed image
+            # If the page passed cleanly or image saving is disabled, do not keep old flawed image
             try:
                 image_path.unlink()
             except OSError:
@@ -240,9 +241,16 @@ class FinancialReportRouter:
                 page_number: self._initial_route(profile)
                 for page_number, profile in profiles.items()
             }
-            active_vlm_model = (
-                self.config.gemini_model if self.config.vlm_provider == "gemini" else self.config.deepseek_model
-            )
+            if self.config.vlm_provider == "gemini":
+                active_vlm_model = self.config.gemini_model
+            elif self.config.vlm_provider == "deepseek":
+                active_vlm_model = self.config.deepseek_model
+            elif self.config.vlm_provider == "openrouter" or (self.config.vlm_provider == "auto" and self.config.openrouter_api_key):
+                active_vlm_model = self.config.openrouter_model
+            elif self.config.vlm_provider == "groq" or (self.config.vlm_provider == "auto" and self.config.groq_api_key):
+                active_vlm_model = self.config.groq_model
+            else:
+                active_vlm_model = "agentic"
             manifest: Dict[str, Any] = {
                 "schema_version": "financial-parser-run-v1",
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -311,16 +319,6 @@ class FinancialReportRouter:
                 if route.engine == EngineName.DOCLING and page_number in docling_output:
                     raw_docling_md = sanitize_markdown(docling_output[page_number])
 
-                    # Recover orphan text / dropped cells / collapsed tables from Docling
-                    markdown, recovery_action = self.orphan_recoverer.recover(
-                        page=page,
-                        markdown=raw_docling_md,
-                        raw_text=profile.raw_text,
-                        char_count=profile.char_count,
-                    )
-                    if recovery_action != "untouched":
-                        print(f"      [Orphan Recovery] Page {page_number}: {recovery_action}", flush=True)
-
                     prev_md = (
                         sanitize_markdown(docling_output[page_number - 1])
                         if (page_number - 1) in docling_output
@@ -331,6 +329,18 @@ class FinancialReportRouter:
                         if (page_number + 1) in docling_output
                         else None
                     )
+
+                    # Recover orphan text / dropped cells / collapsed tables from Docling
+                    markdown, recovery_action = self.orphan_recoverer.recover(
+                        page=page,
+                        markdown=raw_docling_md,
+                        raw_text=profile.raw_text,
+                        char_count=profile.char_count,
+                        prev_markdown=prev_md,
+                        next_markdown=next_md,
+                    )
+                    if recovery_action != "untouched":
+                        print(f"      [Orphan Recovery] Page {page_number}: {recovery_action}", flush=True)
                     qc = evaluate_output(
                         markdown,
                         profile,
@@ -377,8 +387,10 @@ class FinancialReportRouter:
                         except Exception:
                             pass
 
-                    # Page is still bad / severely flawed even after recovery & TATR
-                    if self.vlm.is_available():
+                    # Page has QC issues: follow strict Selective Hybrid Router rule
+                    # ONLY HYBRID or IMAGE_ONLY pages should trigger remote VLM fallback!
+                    # For NATIVE_TEXT pages with digital text: keep Docling output with downgraded warnings to prevent VLM degradation
+                    if self.vlm.is_available() and profile.page_class in (PageClass.HYBRID, PageClass.IMAGE_ONLY):
                         # Route to VLM for high-fidelity vision reconstruction
                         routes[page_number] = RouteDecision(
                             pdf_page=page_number,
@@ -388,8 +400,7 @@ class FinancialReportRouter:
                             fallback_from=EngineName.DOCLING,
                         )
                     else:
-                        # VLM is disabled or unavailable (--no-vlm mode):
-                        # Preserve Docling output with downgraded warnings for downstream testing
+                        # Native text pages stay on Docling with warnings!
                         downgraded_qc = self._continue_with_warning(qc)
                         self._write_page(
                             pages_dir=pages_dir,
@@ -402,10 +413,10 @@ class FinancialReportRouter:
                         )
                         processed[page_number] = {"engine": route.engine.value, "qc": downgraded_qc.status.value}
                         image_path = pages_dir / f"page_{page_number:03d}.png"
-                        rel_img = str(image_path.relative_to(pages_dir.parent)) if image_path.exists() else None
+                        rel_img = str(image_path.relative_to(pages_dir.parent)) if (self.config.save_intermediate_images and image_path.exists()) else None
                         review_records.append(self._review_record(
                             profile, route, qc,
-                            error="Docling QC failed; VLM fallback unavailable (--no-vlm)",
+                            error=f"Docling QC notice: {', '.join(qc.failures[:2]) if qc.failures else 'warning'}",
                             image_path=rel_img,
                         ))
                 elif route.engine == EngineName.DOCLING:
@@ -418,13 +429,15 @@ class FinancialReportRouter:
                             fallback_from=EngineName.DOCLING,
                         )
                     else:
-                        image_path = pages_dir / f"page_{page_number:03d}.png"
-                        try:
-                            pixmap = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
-                            pixmap.save(str(image_path))
-                            rel_img = str(image_path.relative_to(pages_dir.parent))
-                        except Exception:
-                            rel_img = None
+                        rel_img = None
+                        if self.config.save_intermediate_images:
+                            image_path = pages_dir / f"page_{page_number:03d}.png"
+                            try:
+                                pixmap = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
+                                pixmap.save(str(image_path))
+                                rel_img = str(image_path.relative_to(pages_dir.parent))
+                            except Exception:
+                                rel_img = None
                         review_records.append(self._review_record(
                             profile, route, None,
                             error=f"Docling did not return page output; VLM unavailable: {docling_failures.get(page_number, '')}",
@@ -439,13 +452,15 @@ class FinancialReportRouter:
                     api_key_name = "LLAMA_CLOUD_API_KEY" if self.config.vlm_provider in ("llamaparse", "auto") else "API_KEY"
                     for page_number in vlm_pages:
                         page = document[page_number - 1]
-                        image_path = pages_dir / f"page_{page_number:03d}.png"
-                        try:
-                            pixmap = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
-                            pixmap.save(str(image_path))
-                            rel_img = str(image_path.relative_to(pages_dir.parent))
-                        except Exception:
-                            rel_img = None
+                        rel_img = None
+                        if self.config.save_intermediate_images:
+                            image_path = pages_dir / f"page_{page_number:03d}.png"
+                            try:
+                                pixmap = page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
+                                pixmap.save(str(image_path))
+                                rel_img = str(image_path.relative_to(pages_dir.parent))
+                            except Exception:
+                                rel_img = None
                         review_records.append(self._review_record(
                             profiles[page_number], routes[page_number], docling_qc.get(page_number),
                             f"VLM route required but {api_key_name} is not configured",
@@ -474,7 +489,7 @@ class FinancialReportRouter:
                                 processed[p_num] = {"engine": p_route.engine.value, "qc": p_qc.status.value}
                                 if p_raw_qc.status == QCStatus.FAIL:
                                     p_img = pages_dir / f"page_{p_num:03d}.png"
-                                    rel_img = str(p_img.relative_to(pages_dir.parent)) if p_img.exists() else None
+                                    rel_img = str(p_img.relative_to(pages_dir.parent)) if (self.config.save_intermediate_images and p_img.exists()) else None
                                     review_records.append(self._review_record(p_profile, p_route, p_raw_qc, image_path=rel_img))
                                     
                             batch_success = True
@@ -506,18 +521,69 @@ class FinancialReportRouter:
                         for p_num, p_md, p_qc, p_raw_qc, p_route, p_err in vlm_results:
                             p_page = document[p_num - 1]
                             p_profile = profiles[p_num]
-                            if p_err or p_md is None or p_qc is None:
-                                p_image_path = pages_dir / f"page_{p_num:03d}.png"
-                                try:
-                                    pixmap = p_page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
-                                    pixmap.save(str(p_image_path))
-                                    rel_img = str(p_image_path.relative_to(pages_dir.parent))
-                                except Exception:
-                                    rel_img = None
+                            
+                            # If VLM failed or returned inferior output on a page where Docling had valid output:
+                            docling_prev_md = docling_output.get(p_num)
+                            docling_prev_qc = docling_qc.get(p_num)
+                            
+                            use_docling_fallback = False
+                            if (p_err or p_md is None or p_qc is None) and docling_prev_md:
+                                use_docling_fallback = True
+                            elif docling_prev_md and docling_prev_qc and p_raw_qc:
+                                # If Docling had higher numeric recall than VLM:
+                                d_recall = docling_prev_qc.numeric_recall or 0.0
+                                v_recall = p_raw_qc.numeric_recall or 0.0
+                                if d_recall > v_recall and p_raw_qc.status == QCStatus.FAIL:
+                                    use_docling_fallback = True
+                            
+                            if use_docling_fallback and docling_prev_md:
+                                fallback_qc = self._continue_with_warning(docling_prev_qc or QCResult(status=QCStatus.WARNING))
+                                fallback_route = RouteDecision(p_num, EngineName.DOCLING, ["vlm_failed_retained_docling_native"])
+                                self._write_page(
+                                    pages_dir=pages_dir, document_id=document_id, page=p_page,
+                                    profile=p_profile, route=fallback_route, markdown=sanitize_markdown(docling_prev_md), qc=fallback_qc,
+                                )
+                                processed[p_num] = {"engine": EngineName.DOCLING.value, "qc": fallback_qc.status.value}
+                                p_img = pages_dir / f"page_{p_num:03d}.png"
+                                rel_img = str(p_img.relative_to(pages_dir.parent)) if (self.config.save_intermediate_images and p_img.exists()) else None
                                 review_records.append(self._review_record(
-                                    p_profile, p_route, None, p_err or "Empty VLM output", image_path=rel_img
+                                    p_profile, fallback_route, fallback_qc,
+                                    error=f"VLM returned error/poor output; retained Docling native text: {p_err or 'inferior recall'}",
+                                    image_path=rel_img,
                                 ))
-                                processed[p_num] = {"engine": EngineName.MANUAL_REVIEW.value, "qc": "not_run"}
+                            elif p_err or p_md is None or p_qc is None:
+                                # Fallback to native text extraction so NO page is ever left in "not_run" or missing
+                                native_text = p_page.get_text("text") or ""
+                                lines = [line.strip() for line in native_text.splitlines() if line.strip()]
+                                fallback_md = sanitize_markdown("\n\n".join(lines) if lines else f"# Page {p_num}\n\n[Empty Page Content]")
+                                fallback_route = RouteDecision(
+                                    pdf_page=p_num,
+                                    engine=EngineName.DOCLING,
+                                    reason=["vlm_failed_fallback_native"],
+                                    attempt=2,
+                                    fallback_from=p_route.engine,
+                                )
+                                raw_qc = evaluate_output(fallback_md, p_profile, EngineName.DOCLING, self.config)
+                                fallback_qc = self._continue_with_warning(raw_qc)
+                                self._write_page(
+                                    pages_dir=pages_dir, document_id=document_id, page=p_page,
+                                    profile=p_profile, route=fallback_route, markdown=fallback_md, qc=fallback_qc,
+                                )
+                                processed[p_num] = {"engine": EngineName.DOCLING.value, "qc": fallback_qc.status.value}
+                                rel_img = None
+                                if self.config.save_intermediate_images:
+                                    p_image_path = pages_dir / f"page_{p_num:03d}.png"
+                                    try:
+                                        pixmap = p_page.get_pixmap(dpi=self.config.render_dpi, alpha=False)
+                                        pixmap.save(str(p_image_path))
+                                        rel_img = str(p_image_path.relative_to(pages_dir.parent))
+                                    except Exception:
+                                        rel_img = None
+                                review_records.append(self._review_record(
+                                    p_profile, fallback_route, fallback_qc,
+                                    error=f"VLM unavailable/failed; fallback to native text: {p_err or 'Empty VLM output'}",
+                                    image_path=rel_img
+                                ))
                             else:
                                 self._write_page(
                                     pages_dir=pages_dir, document_id=document_id, page=p_page,
@@ -526,7 +592,7 @@ class FinancialReportRouter:
                                 processed[p_num] = {"engine": p_route.engine.value, "qc": p_qc.status.value}
                                 if p_raw_qc and p_raw_qc.status == QCStatus.FAIL:
                                     p_img = pages_dir / f"page_{p_num:03d}.png"
-                                    rel_img = str(p_img.relative_to(pages_dir.parent)) if p_img.exists() else None
+                                    rel_img = str(p_img.relative_to(pages_dir.parent)) if (self.config.save_intermediate_images and p_img.exists()) else None
                                     review_records.append(self._review_record(p_profile, p_route, p_raw_qc, image_path=rel_img))
 
 

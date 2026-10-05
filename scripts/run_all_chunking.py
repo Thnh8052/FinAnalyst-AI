@@ -66,6 +66,12 @@ def parse_args():
         default="1,2,3,4,5",
         help="Các phương pháp cần chạy (vd: 1,2 hoặc 1,2,3,4,5). Mặc định: 1,2,3,4,5.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Số luồng chạy song song (cho local vLLM Continuous Batching). Mặc định: 4.",
+    )
     return parser.parse_args()
 
 
@@ -95,79 +101,57 @@ def main():
     timings: Dict[int, float] = {}
 
     # --- METHOD 1 ---
-    if 1 in active_methods:
+    def execute_method(method_id: int, method_title: str, method_fn) -> float:
         print("\n" + "=" * 70)
-        print("▶️ PHƯƠNG PHÁP 1: NAIVE FIXED-SIZE CHUNKING (512 tokens / 100 overlap)")
+        print(f"▶️ PHƯƠNG PHÁP {method_id}: {method_title}")
+        print(f"   (Xử lý {len(target_specs)} công ty | workers={args.workers})")
         print("=" * 70)
-        m1_start = time.time()
-        for idx, spec in enumerate(target_specs, 1):
-            print(f"[{idx}/{len(target_specs)}] M1 xử lý {spec['ticker']} ({spec['dir_name']})...")
-            try:
-                run_fixed_size_chunking_for_company(spec)
-            except Exception as e:
-                print(f"   [LỖI] M1 cho {spec['dir_name']}: {e}")
-        timings[1] = time.time() - m1_start
-        print(f"✅ Hoàn tất Phương pháp 1 trong {timings[1]:.2f}s")
+        m_start = time.time()
+        if args.workers <= 1 or len(target_specs) <= 1:
+            for idx, spec in enumerate(target_specs, 1):
+                print(f"[{idx}/{len(target_specs)}] M{method_id} xử lý {spec['ticker']} ({spec['dir_name']})...")
+                try:
+                    method_fn(spec)
+                except Exception as e:
+                    print(f"   [LỖI] M{method_id} cho {spec['dir_name']}: {e}")
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            completed_cnt = 0
+            total_cnt = len(target_specs)
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {executor.submit(method_fn, spec): spec for spec in target_specs}
+                for fut in as_completed(futures):
+                    spec = futures[fut]
+                    completed_cnt += 1
+                    try:
+                        fut.result()
+                        print(f"   ✅ [{completed_cnt}/{total_cnt}] M{method_id} hoàn tất: {spec['ticker']} ({spec['dir_name']})", flush=True)
+                    except Exception as e:
+                        print(f"   ❌ [{completed_cnt}/{total_cnt}] M{method_id} lỗi: {spec['dir_name']} -> {e}", flush=True)
+
+        elapsed = time.time() - m_start
+        print(f"✅ Hoàn tất Phương pháp {method_id} trong {elapsed:.2f}s (~{elapsed/60:.1f} phút)")
+        return elapsed
+
+    # --- METHOD 1 ---
+    if 1 in active_methods:
+        timings[1] = execute_method(1, "NAIVE FIXED-SIZE CHUNKING (512 tokens / 100 overlap)", run_fixed_size_chunking_for_company)
 
     # --- METHOD 2 ---
     if 2 in active_methods:
-        print("\n" + "=" * 70)
-        print("▶️ PHƯƠNG PHÁP 2: DETERMINISTIC STRUCTURE-AWARE CHUNKING ($0 LLM, Table-Atomic)")
-        print("=" * 70)
-        m2_start = time.time()
-        for idx, spec in enumerate(target_specs, 1):
-            print(f"[{idx}/{len(target_specs)}] M2 xử lý {spec['ticker']} ({spec['dir_name']})...")
-            try:
-                run_deterministic_chunking_for_company(spec)
-            except Exception as e:
-                print(f"   [LỖI] M2 cho {spec['dir_name']}: {e}")
-        timings[2] = time.time() - m2_start
-        print(f"✅ Hoàn tất Phương pháp 2 trong {timings[2]:.2f}s")
+        timings[2] = execute_method(2, "DETERMINISTIC STRUCTURE-AWARE CHUNKING ($0 LLM, Table-Atomic)", run_deterministic_chunking_for_company)
 
     # --- METHOD 3 ---
     if 3 in active_methods:
-        print("\n" + "=" * 70)
-        print("▶️ PHƯƠNG PHÁP 3: HEADING PRE-SPLIT + LLM MERGE (DeepSeek-Chat, 300-600 words)")
-        print("=" * 70)
-        m3_start = time.time()
-        for idx, spec in enumerate(target_specs, 1):
-            print(f"[{idx}/{len(target_specs)}] M3 xử lý {spec['ticker']} ({spec['dir_name']})...")
-            try:
-                run_method3_for_company(spec)
-            except Exception as e:
-                print(f"   [LỖI] M3 cho {spec['dir_name']}: {e}")
-        timings[3] = time.time() - m3_start
-        print(f"✅ Hoàn tất Phương pháp 3 trong {timings[3]:.2f}s")
+        timings[3] = execute_method(3, "HEADING PRE-SPLIT + LLM MERGE (300-600 words)", run_method3_for_company)
 
     # --- METHOD 4 ---
     if 4 in active_methods:
-        print("\n" + "=" * 70)
-        print("▶️ PHƯƠNG PHÁP 4: LLM BOUNDARY TAGGING (DeepSeek-Chat, Tagged Raw Text)")
-        print("=" * 70)
-        m4_start = time.time()
-        for idx, spec in enumerate(target_specs, 1):
-            print(f"[{idx}/{len(target_specs)}] M4 xử lý {spec['ticker']} ({spec['dir_name']})...")
-            try:
-                run_method4_for_company(spec)
-            except Exception as e:
-                print(f"   [LỖI] M4 cho {spec['dir_name']}: {e}")
-        timings[4] = time.time() - m4_start
-        print(f"✅ Hoàn tất Phương pháp 4 trong {timings[4]:.2f}s")
+        timings[4] = execute_method(4, "LLM BOUNDARY TAGGING (Tagged Raw Text)", run_method4_for_company)
 
     # --- METHOD 5 ---
     if 5 in active_methods:
-        print("\n" + "=" * 70)
-        print("▶️ PHƯƠNG PHÁP 5: PROPOSED GOLDEN HYBRID CHUNKING (Dual Representation)")
-        print("=" * 70)
-        m5_start = time.time()
-        for idx, spec in enumerate(target_specs, 1):
-            print(f"[{idx}/{len(target_specs)}] M5 xử lý {spec['ticker']} ({spec['dir_name']})...")
-            try:
-                run_method5_for_company(spec)
-            except Exception as e:
-                print(f"   [LỖI] M5 cho {spec['dir_name']}: {e}")
-        timings[5] = time.time() - m5_start
-        print(f"✅ Hoàn tất Phương pháp 5 trong {timings[5]:.2f}s")
+        timings[5] = execute_method(5, "PROPOSED GOLDEN HYBRID CHUNKING (Dual Representation)", run_method5_for_company)
 
     # --- TỔNG HỢP MASTER REPORT ---
     print("\n" + "=" * 70)

@@ -10,11 +10,9 @@ Triển khai đúng 3 quy tắc định lượng:
 
 from __future__ import annotations
 
-import json
 import re
 from difflib import SequenceMatcher
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from financial_chunker.enricher import detect_document_fiscal_calendar
 from financial_chunker.models import (
@@ -34,25 +32,32 @@ CONTINUATION_HEADER_PATTERN = re.compile(
 )
 
 
+CLOSING_PUNCT = {".", "?", "!", ":", '"', "”", ")"}
+
+
+def is_top_level_heading(h_text: str) -> bool:
+    """
+    VẤN ĐỀ 2: Nhận diện chính xác ranh giới Section cấp cao (NOTE/ITEM/PART/BCTC chính).
+    Bắt buộc có chữ số hoặc số La Mã đi kèm để tránh bắt nhầm NOTE (continued) hay PART OF SPEECH.
+    """
+    s = h_text.strip().upper()
+    return bool(
+        re.match(r"^(?:NOTE|THUYẾT\s+MINH)\s*\d+", s) or
+        re.match(r"^(?:ITEM|MỤC)\s*\d+[A-Z]?", s) or
+        re.match(r"^PART\s+[IVX]+", s) or
+        re.match(r"^FORM\s+10-[KQ]", s) or
+        "CONSOLIDATED STATEMENTS" in s or
+        "CONSOLIDATED BALANCE SHEETS" in s
+    )
+
+
 def is_valid_footnote(text: str) -> bool:
+    """Bug #10: Nhận diện footnote chân bảng, dọn sạch dead branch."""
     stripped = text.strip()
     if not stripped:
         return False
     if not FOOTNOTE_PATTERN.match(stripped):
         return False
-    # Chống nuốt nhầm câu văn xuôi bắt đầu bằng số (vd: "10 Employees were reassigned...")
-    if re.match(r"^\d{1,2}\.\s+[A-Z]", stripped):
-        lower = stripped.lower()
-        has_fn_cue = any(
-            cue in lower
-            for cue in [
-                "include", "represent", "consist", "footnote", "refer to",
-                "see note", "in thousands", "in millions", "per share",
-                "approximate", "as of", "primarily"
-            ]
-        )
-        if not has_fn_cue and len(stripped) > 200:
-            return False
     return True
 
 
@@ -84,18 +89,20 @@ def compute_column_match_ratio(h1: List[str], h2: List[str]) -> float:
 
 
 def is_open_sentence(text: str) -> bool:
+    """A2: Kiểm tra câu mở unpunctuated bằng ký tự cuối không thuộc CLOSING_PUNCT."""
     stripped = text.strip()
     if not stripped:
         return False
-    return not bool(re.search(r'[\.\?\!\:\"”\)]\s*$', stripped))
+    return stripped[-1] not in CLOSING_PUNCT
 
 
 def is_continuation_start(text: str) -> bool:
+    """A3: Kiểm tra ký tự đầu viết thường (kể cả Unicode tiếng Việt) hoặc số/ngoặc."""
     stripped = text.strip()
     if not stripped:
         return False
-    # Bắt đầu bằng chữ thường hoặc liên từ hoặc số mở ngoặc
-    return bool(re.match(r"^[a-zà-ỹ0-9\(\,\-]", stripped))
+    ch = stripped[0]
+    return ch.islower() or ch.isdigit() or ch in "(,-"
 
 
 def is_section_continuation(
@@ -106,22 +113,13 @@ def is_section_continuation(
     """
     Xác định xem một heading có phải là tiêu đề tiếp diễn (Continuation Header)
     của current_section hay không.
-
-    Quy tắc đa tầng:
-    1. Tiêu chuẩn từ khóa: Tiêu đề phải chứa 'Continued' hoặc 'tiếp theo'.
-    2. Khớp tuyệt đối: Nếu c_code == s_code (vd: 'Note 13' == 'Note 13') -> True.
-    3. Ưu tiên tính liền kề trang (pdf_page == last_page hoặc last_page + 1):
-       - Cứu triệt để lỗi OCR 1 chữ số ở mã số ngắn (vd: '13' bị đọc thành '18', '3' thành '8'):
-         SequenceMatcher("13", "18") chỉ đạt 0.5, nhưng khi ở trang liền kề và cùng độ dài,
-         lệch tối đa 1 ký tự -> Xác định chắc chắn là continuation.
-       - Hỗ trợ mã phân nhánh phụ (vd: '13' vs '13A').
-       - Hỗ trợ tiêu đề tiếp diễn không có mã số (chỉ ghi 'Note Continued' hoặc '(Continued)').
-       - Hỗ trợ trường hợp câu trước dở dang (is_open_sentence).
     """
     if not current_section:
         return False
 
-    has_cont_cue = bool(re.search(r"\b(?:continued|tiếp\s+theo)\b", h_text, re.I))
+    # A4: Kiểm tra từ khóa tiếp diễn không dùng regex
+    _lower = h_text.lower()
+    has_cont_cue = ("continued" in _lower) or ("tiếp theo" in _lower) or ("(cont" in _lower)
     if not has_cont_cue:
         return False
 
@@ -192,6 +190,8 @@ class SectionStitcher:
         cross_page_links: List[Dict[str, Any]] = []
 
         current_table: Optional[StitchedTable] = None
+        stitch_chain_open: bool = False
+        last_table_for_footnote: Optional[StitchedTable] = None
         current_section: Optional[StitchedSection] = None
         table_counter = 0
         section_counter = 0
@@ -211,7 +211,9 @@ class SectionStitcher:
 
                 if b_type == "heading":
                     h_text = block.get("text", "").strip()
-                    h_level = block.get("level", 1)
+
+                    # VẤN ĐỀ 1: BẤT KỲ heading nào cũng bẻ gãy chuỗi ghép bảng vắt trang
+                    stitch_chain_open = False
 
                     # Kiểm tra xem có phải continuation header không (với ưu tiên trang liền kề & cứu OCR nhầm mã số)
                     is_cont = is_section_continuation(h_text, current_section, pdf_page)
@@ -231,6 +233,13 @@ class SectionStitcher:
                         if current_section and current_section.blocks:
                             stitched_sections.append(current_section)
 
+                        # VẤN ĐỀ 1 & S2: CHỈ reset footnote anchor và FLUSH bảng khi là Top-level Heading
+                        if is_top_level_heading(h_text):
+                            if current_table is not None:
+                                stitched_tables.append(current_table)
+                                current_table = None
+                            last_table_for_footnote = None
+
                         section_counter += 1
                         sec_code_match = re.search(r"(?:Note|Thuyết\s+minh|Item)\s*(\d+[A-Za-z]?)", h_text, re.I)
                         sec_code = sec_code_match.group(1) if sec_code_match else None
@@ -242,7 +251,7 @@ class SectionStitcher:
                             parent_section_id=None,
                             source_pages=[pdf_page],
                             blocks=[block],
-                            narrative_text=h_text,
+                            narrative_text="",  # ✅ Sửa Bug #5: Khởi tạo rỗng, không seed bằng h_text
                         )
 
                 elif b_type == "table":
@@ -255,10 +264,11 @@ class SectionStitcher:
 
                     # Kiểm tra ghép bảng vắt trang (Multi-page Table Stitching)
                     can_stitch = False
-                    if current_table is not None:
+                    has_table_above = any(b.get("block_type") == "table" for b in blocks[:b_idx])
+                    if current_table is not None and stitch_chain_open:
                         # Điều kiện 1: Bảng trước nằm ở cuối trang N, bảng này ở đầu trang N+1
                         is_adjacent_page = (pdf_page == current_table.source_pages[-1] + 1)
-                        is_top_of_page = (b_idx <= 1)  # block 0 hoặc block 1 sau page header
+                        is_top_of_page = (b_idx <= 3) and not has_table_above
 
                         if is_adjacent_page and is_top_of_page:
                             # Điều kiện 2: Kiểm tra độ tương đồng cột
@@ -290,6 +300,8 @@ class SectionStitcher:
                             "to_table": current_table.logical_table_id,
                             "table_id": t_id,
                         })
+                        stitch_chain_open = True
+                        last_table_for_footnote = current_table
                     else:
                         # Đóng bảng cũ nếu có
                         if current_table is not None:
@@ -310,6 +322,8 @@ class SectionStitcher:
                             qc_status=page_qc,
                             is_multi_page=False,
                         )
+                        stitch_chain_open = True
+                        last_table_for_footnote = current_table
 
                 elif b_type == "paragraph":
                     p_text = block.get("text", "").strip()
@@ -317,13 +331,23 @@ class SectionStitcher:
                         continue
 
                     # Kiểm tra Footnote Attachment (Quy tắc 3)
-                    # Gắn footnote nếu ở cùng trang HOẶC nằm ngay đầu trang tiếp diễn (b_idx <= 1)
-                    is_same_page_fn = (current_table is not None and len(current_table.source_pages) > 0 and current_table.source_pages[-1] == pdf_page)
-                    is_next_page_fn = (current_table is not None and len(current_table.source_pages) > 0 and pdf_page == current_table.source_pages[-1] + 1 and b_idx <= 1)
-                    if is_same_page_fn or is_next_page_fn:
-                        if is_valid_footnote(p_text):
-                            current_table.footnotes.append(p_text)
-                            continue
+                    # Gắn footnote nếu ở cùng trang HOẶC nằm ngay đầu trang tiếp diễn (b_idx <= 3)
+                    has_table_above = any(b.get("block_type") == "table" for b in blocks[:b_idx])
+                    is_same_page_fn = (
+                        last_table_for_footnote is not None
+                        and len(last_table_for_footnote.source_pages) > 0
+                        and last_table_for_footnote.source_pages[-1] == pdf_page
+                    )
+                    is_next_page_fn = (
+                        last_table_for_footnote is not None
+                        and len(last_table_for_footnote.source_pages) > 0
+                        and pdf_page == last_table_for_footnote.source_pages[-1] + 1
+                        and b_idx <= 3
+                        and not has_table_above
+                    )
+                    if (is_same_page_fn or is_next_page_fn) and is_valid_footnote(p_text):
+                        last_table_for_footnote.footnotes.append(p_text)
+                        continue
 
                     # Nếu không phải footnote, thêm vào section hiện tại
                     if current_section is None:
@@ -348,14 +372,20 @@ class SectionStitcher:
                         current_section.narrative_text += " " + p_text
                         current_section.blocks.append(block)
                         current_section.source_pages.append(pdf_page)
+                        cross_page_links.append({
+                            "type": "narrative_continuation",
+                            "from_page": pdf_page,
+                            "to_section": current_section.logical_section_id,
+                        })
                     else:
-                        if current_section.narrative_text:
-                            current_section.narrative_text += "\n\n" + p_text
-                        else:
-                            current_section.narrative_text = p_text
                         current_section.blocks.append(block)
                         if pdf_page not in current_section.source_pages:
                             current_section.source_pages.append(pdf_page)
+                        if not current_section.narrative_text:
+                            current_section.narrative_text = p_text
+                        else:
+                            current_section.narrative_text += "\n\n" + p_text
+
 
         # Lưu lại table và section cuối cùng
         if current_table is not None:

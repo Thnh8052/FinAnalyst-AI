@@ -89,11 +89,11 @@ def generate_report(output_dir: Path, ground_truth_html: Optional[Path] = None) 
 
     # 4. Dynamically detect and audit core financial statement pages
     core_statement_patterns = [
-        ("Consolidated Statements of Operations / Income", r"Consolidated Statements of (Operations|Income)"),
-        ("Consolidated Statements of Comprehensive Income", r"Consolidated Statements of Comprehensive Income"),
-        ("Consolidated Balance Sheets", r"Consolidated Balance Sheets"),
-        ("Consolidated Statements of Stockholders' Equity", r"Consolidated Statements of (Stockholders'|Shareholders') Equity"),
-        ("Consolidated Statements of Cash Flows", r"Consolidated Statements of Cash Flows"),
+        ("Consolidated Statements of Operations / Income", r"Consolidated Statement(s)? of (Operations|Income|Earnings)(?!\s*Data)"),
+        ("Consolidated Statements of Comprehensive Income", r"Consolidated Statement(s)? of Comprehensive Income"),
+        ("Consolidated Balance Sheets", r"Consolidated Balance Sheet(s)?"),
+        ("Consolidated Statements of Stockholders' Equity", r"Consolidated Statement(s)? of (Stockholders'|Shareholders'|Changes in (Shareholders' |Stockholders' )?Equity)"),
+        ("Consolidated Statements of Cash Flows", r"Consolidated Statement(s)? of Cash Flows"),
     ]
     
     core_statements_audit = []
@@ -107,6 +107,8 @@ def generate_report(output_dir: Path, ground_truth_html: Optional[Path] = None) 
             p_dict = p_json.get("page", {})
             blocks = p_dict.get("blocks", [])
             headings = [b.get("text", "") for b in blocks if b.get("block_type") == "heading"]
+            # Also check section_title if available
+            headings.extend([b.get("section_title", "") for b in blocks if b.get("section_title")])
             full_text = " ".join(headings)
             if re.search(pat, full_text, re.IGNORECASE):
                 matched = True
